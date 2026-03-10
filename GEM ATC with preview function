@@ -36,8 +36,6 @@ try:
     PDF2IMAGE_AVAILABLE = True
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
-
-
 def is_garbage(line: str) -> bool:
     s = line.strip()
     if "ेेतताा" in s or "जजोोड़ड़" in s or "ववशशेषेष" in s:
