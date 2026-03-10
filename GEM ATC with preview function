@@ -633,7 +633,7 @@ class GEMATCGenerator(tk.Tk):
         self.preview_dirty = True
         if self.preview_job is not None:
             self.after_cancel(self.preview_job)
-        self.preview_job = self.after(1000, self.refresh_live_preview)
+        self.preview_job = self.after(100, self.refresh_live_preview)
         if event is not None:
             try:
                 self.text.edit_modified(False)
