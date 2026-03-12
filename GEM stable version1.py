@@ -178,7 +178,7 @@ class ResizeImageWindow(tk.Toplevel):
         self.title(title)
         self.resizable(False, False)
         self.callback = callback
-               self.bulk_option = bulk_option
+        self.bulk_option = bulk_option
         self.parent = parent
         self.enable_reupload = enable_reupload
 
@@ -1808,3 +1808,4 @@ class GEMATCGenerator(tk.Tk):
 if __name__ == "__main__":
     app = GEMATCGenerator()
     app.mainloop()
+
