@@ -1,33 +1,63 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageGrab
 import tempfile
 import shutil
-import os
+import os, sys
 import re
 from threading import Thread
+from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer, Image as RLImage
+from reportlab.platypus import (
+    BaseDocTemplate, PageTemplate, Frame,
+    Paragraph, Spacer, Image as RLImage, KeepTogether, PageBreak
+)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+
+def resource_path(rel_path):
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, rel_path)
+    return os.path.abspath(rel_path)
+
+POPPLER_PATH = resource_path("poppler_bin")
+POPPLER_PATH = r"C:\Users\ASUS\AppData\Local\Programs\Python\Python312\Scripts\poppler-25.12.0\Library\bin"
 
 try:
     import pdfplumber
 except ImportError:
-    messagebox.showerror("Missing pdfplumber", "Please install pdfplumber module.")
+    messagebox.showerror("Missing pdfplumber", "Please install pdfplumber (pip install pdfplumber).")
     raise
 
-def is_garbage(line):
+try:
+    from docx2pdf import convert as docx2pdf_convert
+    DOCX2PDF_AVAILABLE = True
+except ImportError:
+    DOCX2PDF_AVAILABLE = False
+
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+
+
+def is_garbage(line: str) -> bool:
     s = line.strip()
+    if "ेेतताा" in s or "जजोोड़ड़" in s or "ववशशेषेष" in s:
+        return True
     if re.fullmatch(r"\d+/\d+", s):
         return True
     if re.fullmatch(r"((\(cid\:[^\)]+\))|n)+", s):
         return True
-    if s.count("(cid:") >= 2 and all(x in " n()" or x == ":" or x.isdigit() for x in s.replace("(cid:", "").replace(")", "")):
+    if s.count("(cid:") >= 2 and all(
+        x in " n()" or x == ":" or x.isdigit()
+        for x in s.replace("(cid:", "").replace(")", "")
+    ):
         return True
-    if len([x for x in s if x not in "n ()0123456789:cid"])==0 and len(s) > 0:
+    if len([x for x in s if x not in "n ()0123456789:cid"]) == 0 and len(s) > 0:
         return True
     if len(re.findall(r'[a-zA-Z0-9\u0900-\u097F]', s)) < 2:
         return True
@@ -35,58 +65,195 @@ def is_garbage(line):
     if segs and all(seg.startswith("(cid:") or set(seg) <= {"n"} for seg in segs):
         return True
     syllables = re.sub(r"\(cid\:\d+\)", "", s)
-    if (len(syllables) >= 6 and
-        not re.search(r"[\w]+", syllables) and
-        len(re.findall(r'[\u0900-\u097F]', syllables)) > 4 and
-        len(set(syllables.replace(" ", ""))) <= 8):
+    if (
+        len(syllables) >= 6
+        and not re.search(r"[\w]+", syllables)
+        and len(re.findall(r'[\u0900-\u097F]', syllables)) > 4
+        and len(set(syllables.replace(" ", ""))) <= 8
+    ):
         return True
     non_cid = re.sub(r"\(cid\:\d+\)", "", s)
     non_cid = non_cid.strip().replace(" ", "")
     if len(non_cid) > 6 and all('\u0900' <= ch <= '\u097F' for ch in non_cid):
-        bigrams = [non_cid[i:i+2] for i in range(0,len(non_cid),2)]
+        bigrams = [non_cid[i:i + 2] for i in range(0, len(non_cid), 2)]
         if len(set(bigrams)) <= 3:
             return True
     return False
 
+
+PAGE_NUM_REGEXES = [
+    re.compile(r'^\s*\d+\s*$'),
+    re.compile(r'^\s*page\s*\d+\s*$', re.IGNORECASE),
+    re.compile(r'^\s*page\s*\d+\s*of\s*\d+\s*$', re.IGNORECASE),
+    re.compile(r'^\s*\d+\s*/\s*\d+\s*$'),
+]
+
+
+def is_probable_page_number(line: str) -> bool:
+    s = line.strip()
+    for rg in PAGE_NUM_REGEXES:
+        if rg.match(s):
+            return True
+    return False
+
+
+class ArchiveDialog(tk.Toplevel):
+    def __init__(self, parent, archive_entries):
+        super().__init__(parent)
+        self.title("Image Archive")
+        self.configure(bg="#23242e")
+        self.geometry("520x420")
+        self.parent = parent
+        self.entries = archive_entries
+        self.result = None
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(
+            main,
+            text="Select page to reupload:",
+            bg="#23242e",
+            fg="white",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 5))
+
+        list_frame = tk.Frame(main, bg="#23242e")
+        list_frame.pack(fill="both", expand=True)
+
+        self.listbox = tk.Listbox(list_frame, selectmode="single")
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        for idx, entry in enumerate(self.entries):
+            line = entry["line"]
+            title = entry["title"] or "(no title)"
+            title_short = (title[:60] + "...") if len(title) > 60 else title
+            self.listbox.insert("end", f"#{idx+1} | Line {line} | {title_short}")
+
+        btn_frame = tk.Frame(main, bg="#23242e")
+        btn_frame.pack(fill="x", pady=(8, 0))
+        tk.Button(
+            btn_frame,
+            text="OK",
+            command=self.on_ok,
+            bg="#006bce",
+            fg="white",
+            width=8,
+        ).pack(side="left", padx=5)
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            bg="#c0342c",
+            fg="white",
+            width=8,
+        ).pack(side="right", padx=5)
+
+        self.transient(parent)
+        self.grab_set()
+        self.listbox.focus_set()
+
+    def on_ok(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.result = self.entries[idx]
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class ResizeImageWindow(tk.Toplevel):
-    def __init__(self, parent, img_obj, callback=None, title="Resize Image", bulk_option=False):
+    def __init__(self, parent, img_obj, callback=None,
+                 title="Resize Image", bulk_option=False,
+                 enable_reupload=False):
         super().__init__(parent)
         self.title(title)
         self.resizable(False, False)
         self.callback = callback
-        self.bulk_option = bulk_option
+               self.bulk_option = bulk_option
+        self.parent = parent
+        self.enable_reupload = enable_reupload
+
         self.orig_img = img_obj.copy()
         self.img_width, self.img_height = self.orig_img.size
         self.resized_img = self.orig_img.copy()
         self.configure(bg="#22222A")
-        self.geometry("650x560")
+        self.geometry("760x620")
 
-        self.canvas = tk.Canvas(self, width=600, height=400, bg="#efeef5", highlightthickness=0)
-        self.canvas.pack(padx=20, pady=20)
+        self.canvas = tk.Canvas(self, width=640, height=380, bg="#efeef5", highlightthickness=0)
+        self.canvas.pack(padx=20, pady=10)
         self.photo_img = ImageTk.PhotoImage(self.resized_img)
-        self.img_id = self.canvas.create_image(300, 200, image=self.photo_img)
+        self.img_id = self.canvas.create_image(320, 190, image=self.photo_img)
         self.canvas.image = self.photo_img
 
         sliders = tk.Frame(self, bg="#22222A")
-        sliders.pack(fill='x', pady=(0,10))
-        self.w_scale = tk.Scale(sliders, from_=20, to=self.img_width*2, orient='horizontal', label='Width',
-                                bg="#22222A", fg="white", highlightthickness=0)
+        sliders.pack(fill='x', pady=(0, 6))
+
+        max_w = max(self.img_width * 3, 100)
+        max_h = max(self.img_height * 3, 100)
+
+        self.w_scale = tk.Scale(
+            sliders, from_=50, to=max_w, orient='horizontal',
+            label='Width (px)', bg="#22222A", fg="white",
+            highlightthickness=0, length=250
+        )
         self.w_scale.set(self.img_width)
-        self.w_scale.pack(side='left', expand=True, fill='x', padx=10)
-        self.h_scale = tk.Scale(sliders, from_=20, to=self.img_height*2, orient='horizontal', label='Height',
-                                bg="#22222A", fg="white", highlightthickness=0)
+        self.w_scale.pack(side='left', padx=10)
+
+        self.h_scale = tk.Scale(
+            sliders, from_=50, to=max_h, orient='horizontal',
+            label='Height (px)', bg="#22222A", fg="white",
+            highlightthickness=0, length=250
+        )
         self.h_scale.set(self.img_height)
-        self.h_scale.pack(side='left', expand=True, fill='x', padx=10)
+        self.h_scale.pack(side='left', padx=10)
+
+        fit_frame = tk.Frame(self, bg="#22222A")
+        fit_frame.pack(pady=(0, 8))
+        tk.Label(fit_frame, text="Quick Resize:", bg="#22222A", fg="white").pack(side='left', padx=5)
+        tk.Button(fit_frame, text="Fit A4 Width", bg="#148B90", fg="white",
+                  command=self.fit_a4_width).pack(side='left', padx=5)
+        tk.Button(fit_frame, text="Fit A4 Height", bg="#148B90", fg="white",
+                  command=self.fit_a4_height).pack(side='left', padx=5)
 
         btn_frame = tk.Frame(self, bg="#22222A")
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="Save", command=self.save_and_close,
-                  bg="#2573eb", fg="white").pack(side='left', padx=10)
+                  bg="#2573eb", fg="white", width=10).pack(side='left', padx=10)
         tk.Button(btn_frame, text="Cancel", command=self.destroy,
-                  bg="#ef4455", fg="white").pack(side='left', padx=10)
+                  bg="#ef4455", fg="white", width=10).pack(side='left', padx=10)
+
+        if self.enable_reupload:
+            tk.Button(btn_frame, text="Reupload page",
+                      command=self.reupload_page,
+                      bg="#f97316", fg="white", width=14).pack(side='left', padx=10)
 
         self.w_scale.bind("<ButtonRelease>", self.resize_image)
         self.h_scale.bind("<ButtonRelease>", self.resize_image)
+
+    def fit_a4_width(self):
+        target_w = 800
+        ratio = target_w / self.img_width
+        target_h = int(self.img_height * ratio)
+        self.w_scale.set(target_w)
+        self.h_scale.set(max(50, target_h))
+        self.resize_image()
+
+    def fit_a4_height(self):
+        target_h = 700
+        ratio = target_h / self.img_height
+        target_w = int(self.img_width * ratio)
+        self.h_scale.set(target_h)
+        self.w_scale.set(max(50, target_w))
+        self.resize_image()
 
     def resize_image(self, event=None):
         w = self.w_scale.get()
@@ -97,6 +264,12 @@ class ResizeImageWindow(tk.Toplevel):
             self.canvas.itemconfig(self.img_id, image=self.photo_img)
             self.canvas.image = self.photo_img
 
+    def reupload_page(self):
+        if hasattr(self.parent, "run_reupload_flow"):
+            self.parent.run_reupload_flow()
+        else:
+            messagebox.showinfo("Info", "Reupload flow not available.")
+
     def save_and_close(self):
         if self.callback:
             if self.bulk_option:
@@ -104,6 +277,7 @@ class ResizeImageWindow(tk.Toplevel):
             else:
                 self.callback(self.resized_img)
         self.destroy()
+
 
 class ImageSelectDialog(tk.Toplevel):
     def __init__(self, parent, indices, title="Select Image", all_label=True):
@@ -118,9 +292,13 @@ class ImageSelectDialog(tk.Toplevel):
         main = tk.Frame(self, bg="#23242e")
         main.pack(fill="both", expand=True, padx=10, pady=10)
 
-        tk.Label(main, text="Select image to resize:",
-                 bg="#23242e", fg="white",
-                 font=("Arial", 10, "bold")).pack(anchor="w", pady=(0,5))
+        tk.Label(
+            main,
+            text="Select image to resize:",
+            bg="#23242e",
+            fg="white",
+            font=("Arial", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 5))
 
         list_frame = tk.Frame(main, bg="#23242e")
         list_frame.pack(fill="both", expand=True)
@@ -133,18 +311,29 @@ class ImageSelectDialog(tk.Toplevel):
         self.listbox.config(yscrollcommand=scrollbar.set)
 
         for idx in indices:
-            self.listbox.insert("end", f"Image {idx+1}")
+            self.listbox.insert("end", f"Image {idx + 1}")
 
         if all_label:
             self.listbox.insert("end", "All")
 
         btn_frame = tk.Frame(main, bg="#23242e")
-        btn_frame.pack(fill="x", pady=(8,0))
+        btn_frame.pack(fill="x", pady=(8, 0))
 
-        tk.Button(btn_frame, text="OK", command=self.on_ok,
-                  bg="#006bce", fg="white").pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", command=self.on_cancel,
-                  bg="#c0342c", fg="white").pack(side="right", padx=5)
+        tk.Button(
+            btn_frame,
+            text="OK",
+            command=self.on_ok,
+            bg="#006bce",
+            fg="white",
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            bg="#c0342c",
+            fg="white",
+        ).pack(side="right", padx=5)
 
         self.transient(parent)
         self.grab_set()
@@ -162,19 +351,111 @@ class ImageSelectDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+
+class DeletePagesDialog(tk.Toplevel):
+    def __init__(self, parent, page_entries, title="Delete Pages"):
+        super().__init__(parent)
+        self.title(title)
+        self.parent = parent
+        self.result_indices = []
+        self.configure(bg="#23242e")
+        self.geometry("420x520")
+        self.resizable(True, True)
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(
+            main,
+            text="Select pages to delete:",
+            bg="#23242e",
+            fg="white",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 5))
+
+        canvas = tk.Canvas(main, bg="#23242e", highlightthickness=0)
+        scroll_y = tk.Scrollbar(main, orient="vertical", command=canvas.yview)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll_y.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scroll_y.set)
+
+        inner = tk.Frame(canvas, bg="#23242e")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        self.vars = []
+        self.page_entries = page_entries
+
+        for idx, info in enumerate(self.page_entries):
+            var = tk.BooleanVar(value=False)
+            cb = tk.Checkbutton(
+                inner,
+                text=f"Image {idx + 1} | line {info['line']}",
+                variable=var,
+                bg="#23242e",
+                fg="white",
+                selectcolor="#23242e",
+                activebackground="#23242e",
+                activeforeground="white",
+                anchor="w",
+                padx=4,
+            )
+            cb.pack(fill="x", anchor="w")
+            self.vars.append(var)
+
+        inner.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        btn_frame = tk.Frame(main, bg="#23242e")
+        btn_frame.pack(fill="x", pady=(8, 0))
+
+        tk.Button(
+            btn_frame,
+            text="Delete",
+            command=self.on_delete,
+            bg="#c0342c",
+            fg="white",
+            width=10,
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            bg="#006bce",
+            fg="white",
+            width=10,
+        ).pack(side="right", padx=5)
+
+        self.transient(parent)
+        self.grab_set()
+        self.focus_set()
+
+    def on_delete(self):
+        self.result_indices = [i for i, v in enumerate(self.vars) if v.get()]
+        if not self.result_indices:
+            messagebox.showinfo("Info", "Please select at least one page to delete.")
+            return
+        self.destroy()
+
+    def on_cancel(self):
+        self.result_indices = []
+        self.destroy()
+
+
 class GEMATCGenerator(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("GEM ATC Generator")
         self.configure(bg="#23242e")
-        self.geometry(self.center_on_screen(980, 740))
+        self.geometry(self.center_on_screen(1360, 780))
         self.status_text = tk.StringVar()
         self.temp_dir = tempfile.mkdtemp()
         self.doc_list = []
         self.tk_images = []
-        # [type, path, line_index, pil_img, slot_name, align]
         self.tracked_images = []
         self.pdf_images = []
+        self.docs_images = []
+        self.image_archive = []
         self.header_img_resized = None
         self.footer_img_resized = None
         self.font_name = "Helvetica"
@@ -192,88 +473,323 @@ class GEMATCGenerator(tk.Tk):
         self.page_break_notified = False
         self.text_sizes = {}
 
+        self.preview_thread = None
+        self.export_thread = None
+
         top_frame = tk.Frame(self, bg="#23242e")
         top_frame.pack(fill="x", padx=10, pady=8)
         but_props = dict(bg="#006bce", fg="#fff", font=("Arial", 10, "bold"),
-                         padx=14, pady=4, bd=0, relief='ridge')
-        tk.Button(top_frame, text="Upload Tender PDF", command=self._extract_tc, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Add Header", command=lambda: self.upload_image_file("header"), **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Edit Header", command=lambda: self.edit_image("header"), **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Add Footer", command=lambda: self.upload_image_file("footer"), **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Edit Footer", command=lambda: self.edit_image("footer"), **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Add Docs", command=self.prompt_add_docs, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Submit Docs", command=self.insert_docs, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Resize Docs", command=self.resize_doc, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Preview PDF", command=self.show_preview, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Export to PDF", command=self.export_to_pdf, **but_props).pack(side='left', padx=5)
-        tk.Button(top_frame, text="Change Theme Color", command=self.change_theme_color,
+                         padx=10, pady=4, bd=0, relief='ridge')
+
+        tk.Button(top_frame, text="Upload Tender PDF", command=self._extract_tc, **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Add Header", command=lambda: self.upload_image_file("header"), **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Edit Header", command=lambda: self.edit_image("header"), **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Add Footer", command=lambda: self.upload_image_file("footer"), **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Edit Footer", command=lambda: self.edit_image("footer"), **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Add Docs", command=self.prompt_add_docs, **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Submit Docs", command=self.insert_docs, **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Resize Docs", command=self.resize_doc, **but_props).pack(side='left', padx=3)
+        tk.Button(top_frame, text="Export to PDF", command=self.export_to_pdf, **but_props).pack(side='left', padx=3)
+
+        tk.Button(top_frame, text="Change Theme", command=self.change_theme_color,
                   bg="#7646d0", fg="#fff", font=("Arial", 10, "bold"),
-                  padx=14, pady=4).pack(side='left', padx=5)
+                  padx=10, pady=4).pack(side='left', padx=3)
         tk.Button(top_frame, text="Clear All", command=self.clear_all,
                   bg="#c0342c", fg="#fff", font=("Arial", 10, "bold"),
-                  padx=14, pady=4).pack(side='left', padx=5)
+                  padx=10, pady=4).pack(side='left', padx=3)
 
-        toolbar = tk.Frame(self, bg="#23242e")
-        toolbar.pack(fill="x", pady=6)
-        tk.Button(toolbar, text="𝐁", command=lambda: self.tag_add("bold")).pack(side='left', padx=3)
-        tk.Button(toolbar, text="𝐼", command=lambda: self.tag_add("italic")).pack(side='left', padx=3)
-        tk.Button(toolbar, text="𝑈", command=lambda: self.tag_add("underline")).pack(side='left', padx=3)
-        tk.Button(toolbar, text="L", command=lambda: self.set_alignment('left')).pack(side='left', padx=3)
-        tk.Button(toolbar, text="C", command=lambda: self.set_alignment('center')).pack(side='left', padx=3)
-        tk.Button(toolbar, text="R", command=lambda: self.set_alignment('right')).pack(side='left', padx=3)
-        tk.Button(toolbar, text="•", command=lambda: self.tag_add("bullet")).pack(side='left', padx=3)
-        tk.Button(toolbar, text="Heading", command=self.make_heading).pack(side='left', padx=3)
-        tk.Label(toolbar, text="Font Size: ", bg="#23242e", fg="#fff",
-                 font=("Arial", 10)).pack(side='left', padx=5)
+        mid = tk.Frame(self, bg="#23242e")
+        mid.pack(fill="both", expand=True, padx=6, pady=4)
+
+        left_panel = tk.Frame(mid, bg="#23242e")
+        left_panel.pack(side="left", fill="both", expand=True)
+
+        right_panel = tk.Frame(mid, bg="#181820", bd=1, relief="sunken", width=520)
+        right_panel.pack(side="right", fill="both", expand=False, padx=4)
+        right_panel.pack_propagate(False)
+
+        toolbar = tk.Frame(left_panel, bg="#23242e")
+        toolbar.pack(fill="x", pady=4)
+        tk.Button(toolbar, text="𝐁", command=lambda: self.tag_add("bold")).pack(side='left', padx=2)
+        tk.Button(toolbar, text="𝐼", command=lambda: self.tag_add("italic")).pack(side='left', padx=2)
+        tk.Button(toolbar, text="𝑈", command=lambda: self.tag_add("underline")).pack(side='left', padx=2)
+        tk.Button(toolbar, text="L", command=lambda: self.set_alignment('left')).pack(side='left', padx=2)
+        tk.Button(toolbar, text="C", command=lambda: self.set_alignment('center')).pack(side='left', padx=2)
+        tk.Button(toolbar, text="R", command=lambda: self.set_alignment('right')).pack(side='left', padx=2)
+        tk.Button(toolbar, text="•", command=lambda: self.tag_add("bullet")).pack(side='left', padx=2)
+        tk.Button(toolbar, text="Heading", command=self.make_heading).pack(side='left', padx=2)
+
+        tk.Label(toolbar, text="Font Size: ", bg="#23242e", fg="white",
+                 font=("Arial", 10)).pack(side='left', padx=4)
         self.font_size_var = tk.IntVar(value=12)
-        sizes = list(range(8,31))
+        sizes = list(range(8, 31))
         size_combo = ttk.Combobox(toolbar, textvariable=self.font_size_var,
                                   values=sizes, width=3)
         size_combo.set(12)
-        size_combo.pack(side='left', padx=3)
+        size_combo.pack(side='left', padx=2)
         size_combo.bind("<<ComboboxSelected>>", self.change_font_size)
 
         tk.Button(toolbar, text="docs pdf paster",
                   command=self.start_docs_pdf_paster,
-                  bg="#f97316", fg="#fff", font=("Arial", 10, "bold")).pack(side='left', padx=7)
+                  bg="#f97316", fg="#fff", font=("Arial", 10, "bold")).pack(side='left', padx=5)
         tk.Button(toolbar, text="pdf paster resize",
                   command=self.pdf_paster_resize,
-                  bg="#107d4e", fg="#fff", font=("Arial", 10, "bold")).pack(side='left', padx=3)
+                  bg="#107d4e", fg="#fff", font=("Arial", 10, "bold")).pack(side='left', padx=2)
+        tk.Button(toolbar, text="Paste Image",
+                  command=self.paste_image_from_clipboard,
+                  bg="#148B90", fg="#fff", font=("Arial", 10, "bold")).pack(side='left', padx=5)
 
-        self.text = ScrolledText(self, wrap=tk.WORD, font=(self.font_name, 12),
-                                 undo=True, autoseparators=True, maxundo=-1,
-                                 bg="#222234", fg="#e0e0e0",
-                                 insertbackground="#66cccc",
-                                 selectbackground="#003366",
-                                 padx=12, pady=12)
-        self.text.pack(fill="both", expand=True, padx=10, pady=2)
+        # Text next page button completely removed
+
+        tk.Button(toolbar, text="Preview PDF",
+                  command=self.manual_preview_click,
+                  bg="#2563eb", fg="#fff", font=("Arial", 10, "bold")).pack(side='right', padx=4)
+
+        self.text = ScrolledText(
+            left_panel, wrap=tk.WORD, font=(self.font_name, 12),
+            undo=True, autoseparators=True, maxundo=-1,
+            bg="#222234", fg="#e0e0e0",
+            insertbackground="#66cccc",
+            selectbackground="#003366",
+            padx=12, pady=12
+        )
+        self.text.pack(fill="both", expand=True, padx=4, pady=2)
         self.text.bind('<Button-1>', self.track_cursor)
-        self.text.bind('<KeyRelease>', self.check_page_break_notification)
-        self.text.tag_config("bold", font=(self.font_name,12,"bold"))
-        self.text.tag_config("italic", font=(self.font_name,12,"italic"))
-        self.text.tag_config("underline", font=(self.font_name,12,"underline"))
+        self.text.bind('<KeyRelease>', self.on_editor_change)
+        self.text.bind('<Key>', self.on_key)
+        self.text.bind("<<Modified>>", self.on_editor_change)
+
+        self.text.tag_config("bold", font=(self.font_name, 12, "bold"))
+        self.text.tag_config("italic", font=(self.font_name, 12, "italic"))
+        self.text.tag_config("underline", font=(self.font_name, 12, "underline"))
         self.text.tag_config("left", justify="left")
         self.text.tag_config("center", justify="center")
         self.text.tag_config("right", justify="right")
         self.text.tag_config("bullet", lmargin1=24, spacing1=7)
-        self.text.tag_config("heading", font=(self.font_name,17,"bold"),
+        self.text.tag_config("heading", font=(self.font_name, 17, "bold"),
                              justify="center", spacing1=14, spacing3=12)
+
+        tk.Label(right_panel, text="PDF Preview", bg="#181820", fg="#e5e7eb",
+                 font=("Arial", 11, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
+
+        self.preview_canvas = tk.Canvas(
+            right_panel,
+            bg="#111827",
+            highlightthickness=0
+        )
+        self.preview_canvas.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+
+        self.preview_scroll = tk.Scrollbar(
+            right_panel,
+            orient="vertical",
+            command=self.preview_canvas.yview
+        )
+        self.preview_scroll.pack(side="right", fill="y")
+        self.preview_canvas.configure(yscrollcommand=self.preview_scroll.set)
+
+        self.preview_inner = tk.Frame(self.preview_canvas, bg="#111827")
+        self.preview_canvas.create_window((0, 0), window=self.preview_inner, anchor="nw")
+        self.preview_pages_tk = []
+
+        def on_config(event):
+            self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
+        self.preview_inner.bind("<Configure>", on_config)
 
         status_frame = tk.Frame(self, bg="#23242e")
         status_frame.pack(side="bottom", fill="x")
-        self.status = tk.Label(status_frame, textvariable=self.status_text, bd=1,
-                               relief="sunken", anchor="w",
-                               bg="#384150", fg="white", font=("Arial", 10))
+        self.status = tk.Label(
+            status_frame, textvariable=self.status_text, bd=1,
+            relief="sunken", anchor="w",
+            bg="#384150", fg="white", font=("Arial", 10)
+        )
         self.status.pack(side="left", fill="x", expand=True)
+
+        self.clock_label = tk.Label(
+            status_frame, text="", bd=1,
+            relief="sunken", anchor="e",
+            bg="#384150", fg="#ffd166",
+            font=("Consolas", 10, "bold")
+        )
+        self.clock_label.pack(side="right", padx=5, pady=2)
+
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress = ttk.Progressbar(status_frame, orient="horizontal",
-                                        mode="determinate", variable=self.progress_var,
-                                        length=200)
+        self.progress = ttk.Progressbar(
+            status_frame, orient="horizontal",
+            mode="determinate", variable=self.progress_var,
+            length=180
+        )
         self.progress.pack(side="right", padx=5, pady=2)
-        self.wait_label = tk.Label(status_frame, text="", bg="#23242e",
-                                   fg="#ffd166", font=("Arial", 9, "italic"))
+
+        self.wait_label = tk.Label(
+            status_frame, text="", bg="#23242e",
+            fg="#ffd166", font=("Arial", 9, "italic")
+        )
         self.wait_label.pack(side="right", padx=5)
+
         self.status_text.set("Ready")
+        self.update_clock()
+
+        if not PDF2IMAGE_AVAILABLE:
+            self.status_text.set("Preview disabled (install pdf2image for live preview).")
+
+    # ------- editor events -------
+    def on_editor_change(self, event=None):
+        self.check_page_break_notification()
+        if event is not None:
+            try:
+                self.text.edit_modified(False)
+            except Exception:
+                pass
+
+    # ------- smooth preview (thread + progress) -------
+    def manual_preview_click(self):
+        if not PDF2IMAGE_AVAILABLE:
+            messagebox.showwarning(
+                "Preview disabled",
+                "Live preview ke liye 'pdf2image' + poppler chahiye.\nAbhi sirf Export to PDF ka use karein."
+            )
+            return
+        if self.preview_thread and self.preview_thread.is_alive():
+            messagebox.showinfo("Preview", "Preview already running, please wait.")
+            return
+        self.progress.config(mode="indeterminate")
+        self.progress_var.set(0)
+        self.wait_label.config(text="Generating preview, please wait...")
+        self.status_text.set("Generating preview PDF...")
+        self.progress.start(10)
+        self.preview_thread = Thread(target=self._preview_worker, daemon=True)
+        self.preview_thread.start()
+
+    def _preview_worker(self):
+        tmp_pdf = os.path.join(self.temp_dir, "live_preview.pdf")
+        try:
+            self._pdf_preview_render(tmp_pdf, show_message=False)
+            if os.path.exists(tmp_pdf) and os.path.getsize(tmp_pdf) > 0:
+                try:
+                    kwargs = {"dpi": 130}
+                    if POPPLER_PATH:
+                        kwargs["poppler_path"] = POPPLER_PATH
+                    pages = convert_from_path(tmp_pdf, **kwargs)
+                except Exception:
+                    pages = []
+
+                def update_preview():
+                    for child in self.preview_inner.winfo_children():
+                        child.destroy()
+                    self.preview_pages_tk.clear()
+                    if not pages:
+                        self.status_text.set("Preview image not available yet.")
+                    else:
+                        target_w = 500
+                        a4_w, a4_h = A4
+                        aspect = a4_h / a4_w
+                        target_h = int(target_w * aspect)
+                        for img in pages:
+                            img = img.convert("RGB")
+                            img_resized = img.resize((target_w, target_h), Image.LANCZOS)
+                            tkimg = ImageTk.PhotoImage(img_resized)
+                            self.preview_pages_tk.append(tkimg)
+                            lbl = tk.Label(self.preview_inner, image=tkimg, bg="#111827")
+                            lbl.pack(pady=8)
+                        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
+                        self.status_text.set("Preview ready.")
+                    self.progress.stop()
+                    self.progress_var.set(0)
+                    self.progress.config(mode="determinate")
+                    self.wait_label.config(text="")
+                self.after(0, update_preview)
+            else:
+                def no_content():
+                    for child in self.preview_inner.winfo_children():
+                        child.destroy()
+                    self.preview_pages_tk.clear()
+                    self.status_text.set("No content to preview.")
+                    self.progress.stop()
+                    self.progress_var.set(0)
+                    self.progress.config(mode="determinate")
+                    self.wait_label.config(text="")
+                self.after(0, no_content)
+        except Exception as e:
+            def show_err():
+                self.status_text.set("Error while generating preview.")
+                messagebox.showerror("Preview Error", f"Preview failed: {e}")
+                self.progress.stop()
+                self.progress_var.set(0)
+                self.progress.config(mode="determinate")
+                self.wait_label.config(text="")
+            self.after(0, show_err)
+
+    # ------- smooth Export (thread + progress) -------
+    def export_to_pdf(self):
+        output_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf")],
+            title="Save ATC as PDF"
+        )
+        if not output_path:
+            return
+        if self.export_thread and self.export_thread.is_alive():
+            messagebox.showinfo("Export", "Export already running, please wait.")
+            return
+        self.progress.config(mode="indeterminate")
+        self.progress_var.set(0)
+        self.wait_label.config(text="Exporting PDF, please wait...")
+        self.status_text.set(f"Exporting to {output_path} ...")
+        self.progress.start(10)
+        self.export_thread = Thread(target=self._export_worker, args=(output_path,), daemon=True)
+        self.export_thread.start()
+
+    def _export_worker(self, output_file):
+        try:
+            self._pdf_preview_render(output_file, show_message=False)
+            def done():
+                self.status_text.set(f"PDF exported: {output_file}")
+                messagebox.showinfo("Success", "PDF has been exported successfully.")
+                self.progress.stop()
+                self.progress_var.set(0)
+                self.progress.config(mode="determinate")
+                self.wait_label.config(text="")
+            self.after(0, done)
+        except Exception as e:
+            def show_err():
+                self.status_text.set("Error exporting PDF.")
+                messagebox.showerror("Export Error", f"PDF export failed: {e}")
+                self.progress.stop()
+                self.progress_var.set(0)
+                self.progress.config(mode="determinate")
+                self.wait_label.config(text="")
+            self.after(0, show_err)
+
+    # ------- key / formatting -------
+    def on_key(self, event):
+        if event.keysym != "BackSpace":
+            return
+        try:
+            cur_index = self.text.index("insert")
+            cur_line = int(cur_index.split('.')[0])
+            line_image_names = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if int(idx.split('.')[0]) == cur_line:
+                    line_image_names.append(img_name)
+            if not line_image_names:
+                return
+            for img_name in line_image_names:
+                self.text.delete(self.text.index(img_name))
+            self.tracked_images = [r for r in self.tracked_images if r[0] != cur_line]
+            self.pdf_images = [r for r in self.pdf_images if r[2] != cur_line]
+            self.docs_images = [r for r in self.docs_images if r[2] != cur_line]
+            self.image_archive = [e for e in self.image_archive if e["line"] != cur_line]
+            self.status_text.set(f"Image/slide permanently removed from line {cur_line} using Backspace.")
+            self.on_editor_change()
+        except Exception:
+            pass
+
+    def update_clock(self):
+        now = datetime.now()
+        timestr = now.strftime("%a %d %b %Y %I:%M:%S %p")
+        self.clock_label.config(text=timestr)
+        self.after(1000, self.update_clock)
 
     def center_on_screen(self, w, h):
         sw = self.winfo_screenwidth()
@@ -288,239 +804,6 @@ class GEMATCGenerator(tk.Tk):
         except tk.TclError:
             current_pos = self.text.index("insert")
             self.text.tag_add(tag_name, current_pos, f"{current_pos} lineend")
-
-    # ---------- PDF paste as images ----------
-
-    def start_docs_pdf_paster(self):
-        filetypes = [("PDF Files", "*.pdf"), ("All Files", "*.*")]
-        pdf_path = filedialog.askopenfilename(title="Select PDF for Paste", filetypes=filetypes)
-        if not pdf_path:
-            return
-
-        self.progress_var.set(0)
-        self.progress.config(mode="determinate")
-        self.wait_label.config(text="Please Wait Fetching Data...")
-        self.status_text.set("Loading PDF pages as images...")
-
-        Thread(target=self.docs_pdf_paster_thread, args=(pdf_path,), daemon=True).start()
-
-    def docs_pdf_paster_thread(self, pdf_path):
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                total_pages = len(pdf.pages) or 1
-                for idx, page in enumerate(pdf.pages, start=1):
-                    img_page = page.to_image(resolution=150).original.convert("RGB")
-                    if img_page.width > 700:
-                        h = int(img_page.height * (700 / img_page.width))
-                        img_page = img_page.resize((700, h), Image.LANCZOS)
-
-                    self.after(0, self._insert_pdf_page_image, img_page)
-                    progress_val = (idx / total_pages) * 100.0
-                    self.after(0, self.progress_var.set, progress_val)
-
-            self.after(0, self._pdf_paste_done)
-
-        except Exception as e:
-            def show_err():
-                messagebox.showerror("Error", f"Failed to paste PDF as images: {e}")
-                self.status_text.set("Error processing PDF.")
-                self.wait_label.config(text="")
-                self.progress_var.set(0)
-            self.after(0, show_err)
-
-    def _insert_pdf_page_image(self, img_page):
-        img_tk = ImageTk.PhotoImage(img_page)
-        self.tk_images.append(img_tk)
-        line_index = int(self.text.index(tk.INSERT).split('.')[0])
-        index_str = f"{line_index}.0"
-        slot_name = self.text.image_create(index_str, image=img_tk)
-        rec = ["img", None, line_index, img_page, slot_name, "center"]
-        self.tracked_images.append(rec)
-        self.pdf_images.append(rec)
-        self.text.insert(f"{line_index+1}.0", "\n")
-
-    def _pdf_paste_done(self):
-        self.status_text.set("PDF pages pasted as images.")
-        self.wait_label.config(text="")
-        self.progress_var.set(0)
-
-    # ---------- PDF paster resize (copies remove) ----------
-
-    def pdf_paster_resize(self):
-        imgs = [i for i, item in enumerate(self.pdf_images) if item[0] == "img"]
-        if not imgs:
-            messagebox.showinfo("Info", "No pasted PDF images to resize.")
-            return
-
-        dialog = ImageSelectDialog(self, imgs, title="Resize PDF Images")
-        self.wait_window(dialog)
-        choice = dialog.result
-        if not choice:
-            return
-
-        choice = choice.strip().lower()
-        if choice == "all":
-            first_img = self.pdf_images[imgs[0]][3]
-            ResizeImageWindow(
-                self,
-                first_img,
-                lambda w, h: self._resize_all_pdf_images_keep_only_resized(w, h),
-                title="Resize All PDF Images",
-                bulk_option=True
-            ).focus()
-        else:
-            try:
-                selected_idx = int(choice.split()[-1]) - 1
-                if selected_idx in imgs:
-                    self._launch_pdf_resize(selected_idx)
-                else:
-                    messagebox.showerror("Error", f"Image {selected_idx+1} not found.")
-            except Exception:
-                messagebox.showerror("Error", "Invalid selection!")
-
-    def _resize_all_pdf_images_keep_only_resized(self, width, height):
-        """
-        Har PDF page line:
-        - us line ki saari images ko text.delete(idx) se hatao,
-        - sirf ek nayi resized image wapas daalo.
-        """
-        new_pdf_images = []
-        for rec in self.pdf_images:
-            if rec[0] != "img" or rec[3] is None:
-                continue
-            line = rec[2]
-
-            # line par saari embedded images delete
-            to_delete = []
-            for img_name in self.text.image_names():
-                idx = self.text.index(img_name)
-                if int(idx.split('.')[0]) == line:
-                    to_delete.append(idx)
-            for idx in to_delete:
-                self.text.delete(idx)
-
-            resized_img = rec[3].resize((width, height), Image.LANCZOS)
-            img_tk = ImageTk.PhotoImage(resized_img)
-            self.tk_images.append(img_tk)
-            index_str = f"{line}.0"
-            slot_name = self.text.image_create(index_str, image=img_tk)
-
-            rec[3] = resized_img
-            rec[4] = slot_name
-            rec[2] = line
-            new_pdf_images.append(rec)
-
-        self.pdf_images = new_pdf_images
-        self.status_text.set("All PDF images resized (no copies).")
-
-    def _launch_pdf_resize(self, index):
-        rec = self.pdf_images[index]
-        img_obj = rec[3]
-        line = rec[2]
-
-        def on_resize(resized_img):
-            # line ki saari images delete
-            to_delete = []
-            for img_name in self.text.image_names():
-                idx = self.text.index(img_name)
-                if int(idx.split('.')[0]) == line:
-                    to_delete.append(idx)
-            for idx in to_delete:
-                self.text.delete(idx)
-
-            img_tk = ImageTk.PhotoImage(resized_img)
-            self.tk_images.append(img_tk)
-            index_str = f"{line}.0"
-            slot_name = self.text.image_create(index_str, image=img_tk)
-            rec[3] = resized_img
-            rec[4] = slot_name
-            self.status_text.set("Selected PDF image resized (single, no copies).")
-
-        ResizeImageWindow(self, img_obj, on_resize, title="Resize PDF Image").focus()
-
-    # ---------- Resize Docs (non‑PDF images) ----------
-
-    def resize_doc(self):
-        imgs = [i for i, item in enumerate(self.tracked_images) if item[0] == "img"]
-        if not imgs:
-            messagebox.showinfo("Info", "No images to resize.")
-            return
-
-        dialog = ImageSelectDialog(self, imgs, title="Resize Document Images")
-        self.wait_window(dialog)
-        choice = dialog.result
-        if not choice:
-            return
-
-        choice = choice.strip().lower()
-        if choice == "all":
-            first_img = self.tracked_images[imgs[0]][3]
-            ResizeImageWindow(self, first_img, self._resize_all_docs_keep_only_resized,
-                              title="Resize All Document Images", bulk_option=True).focus()
-        else:
-            try:
-                selected_idx = int(choice.split()[-1]) - 1
-                if selected_idx in imgs:
-                    self._launch_doc_resize(selected_idx)
-                else:
-                    messagebox.showerror("Error", f"Image {selected_idx+1} not found.")
-            except Exception:
-                messagebox.showerror("Error", "Invalid selection!")
-
-    def _resize_all_docs_keep_only_resized(self, width, height):
-        for rec in self.tracked_images:
-            if rec[0] != "img" or rec[3] is None:
-                continue
-            line = rec[2]
-
-            to_delete = []
-            for img_name in self.text.image_names():
-                idx = self.text.index(img_name)
-                if int(idx.split('.')[0]) == line:
-                    to_delete.append(idx)
-            for idx in to_delete:
-                self.text.delete(idx)
-
-            resized_img = rec[3].resize((width, height), Image.LANCZOS)
-            img_tk = ImageTk.PhotoImage(resized_img)
-            self.tk_images.append(img_tk)
-            index_str = f"{line}.0"
-            slot_name = self.text.image_create(index_str, image=img_tk)
-            rec[3] = resized_img
-            rec[4] = slot_name
-
-        self.status_text.set("All document images resized (no copies).")
-
-    def _launch_doc_resize(self, index):
-        rec = self.tracked_images[index]
-        path, line, img_obj = rec[1], rec[2], rec[3]
-        if img_obj is None and path:
-            try:
-                img_obj = Image.open(path)
-            except Exception:
-                messagebox.showerror("Error", "Cannot open original image.")
-                return
-
-        def on_resize(resized_img):
-            to_delete = []
-            for img_name in self.text.image_names():
-                idx = self.text.index(img_name)
-                if int(idx.split('.')[0]) == line:
-                    to_delete.append(idx)
-            for idx in to_delete:
-                self.text.delete(idx)
-
-            img_tk = ImageTk.PhotoImage(resized_img)
-            self.tk_images.append(img_tk)
-            index_str = f"{line}.0"
-            slot_name = self.text.image_create(index_str, image=img_tk)
-            rec[3] = resized_img
-            rec[4] = slot_name
-            self.status_text.set("Document image resized (no copies).")
-
-        ResizeImageWindow(self, img_obj, on_resize, title="Resize Image").focus()
-
-    # ---------- Formatting / other helpers ----------
 
     def set_alignment(self, align):
         try:
@@ -555,6 +838,34 @@ class GEMATCGenerator(tk.Tk):
             self.text_sizes[(current_pos, f"{current_pos} lineend")] = size
             self.status_text.set(f"Font size set to {size} for current line.")
 
+    def make_heading(self):
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+        except tk.TclError:
+            cur = self.text.index("insert")
+            line_no = cur.split('.')[0]
+            line_start = f"{line_no}.0"
+            line_end = f"{line_no}.0 lineend"
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if idx.split('.')[0] == line_no:
+                    messagebox.showinfo(
+                        "Info",
+                        "Image wali line ko heading nahi bana sakte. Heading ko image ke upar ya kisi text line par rakho."
+                    )
+                    return
+            start, end = line_start, line_end
+        for tag in ["bold", "italic", "underline", "left", "right", "center", "bullet"]:
+            self.text.tag_remove(tag, start, end)
+        self.text.tag_add("heading", start, end)
+
+    def track_cursor(self, event):
+        try:
+            self.last_cursor_pos = self.text.index(f"@{event.x},{event.y}")
+        except Exception:
+            pass
+
     def check_page_break_notification(self, event=None):
         try:
             cursor_line = int(self.text.index("insert").split('.')[0])
@@ -564,16 +875,13 @@ class GEMATCGenerator(tk.Tk):
             page_end_line = (current_page + 1) * max_lines_per_page
             if cursor_line >= page_end_line - 3 and not self.page_break_notified:
                 self.page_break_notified = True
-                messagebox.showinfo("Page Break Notice", "Page break approaching. Please type your content on the next page.")
+                messagebox.showinfo(
+                    "Page Break Notice",
+                    "Page break approaching. Please type your content on the next page."
+                )
             elif cursor_line < page_end_line - 3:
                 self.page_break_notified = False
         except Exception:
-            pass
-
-    def track_cursor(self, event):
-        try:
-            self.last_cursor_pos = self.text.index(f"@{event.x},{event.y}")
-        except:
             pass
 
     def change_theme_color(self):
@@ -584,22 +892,177 @@ class GEMATCGenerator(tk.Tk):
         for widget in self.winfo_children():
             try:
                 widget.configure(bg=new_color)
-            except:
+            except Exception:
                 pass
 
-    def make_heading(self):
+    def _title_for_line(self, line):
+        for l in range(line - 1, 0, -1):
+            txt = self.text.get(f"{l}.0", f"{l}.0 lineend").strip()
+            if txt:
+                return txt
+        return ""
+
+    def _add_to_archive(self, line, img):
+        entry_id = id(img)
+        title = self._title_for_line(line)
+        self.image_archive.append({
+            "id": entry_id,
+            "line": line,
+            "img": img,
+            "width": img.size[0],
+            "height": img.size[1],
+            "title": title
+        })
+
+    def _update_archive_entry(self, line, new_img):
+        for entry in self.image_archive:
+            if entry["line"] == line:
+                entry["img"] = new_img
+                entry["width"], entry["height"] = new_img.size
+                entry["title"] = self._title_for_line(line)
+                return
+        self._add_to_archive(line, new_img)
+
+    # ---------- image insertion ----------
+    def _insert_image_inline(self, pil_img, align="center",
+                             is_pdf=False, is_docs=False):
+        insert_index = self.text.index("insert")
+        line_no = int(insert_index.split('.')[0])
+
+        for img_name in self.text.image_names():
+            idx = self.text.index(img_name)
+            if idx == insert_index:
+                self.text.delete(idx)
+        self.text.insert(insert_index, "\n")
+        insert_index = self.text.index("insert")
+
+        img_tk = ImageTk.PhotoImage(pil_img)
+        self.tk_images.append(img_tk)
+        self.text.image_create(insert_index, image=img_tk)
+        self.text.insert(self.text.index(insert_index) + " lineend", "\n")
+
+        line_no = int(self.text.index(insert_index).split('.')[0])
+        rec = (line_no, pil_img, align)
+        self.tracked_images = [r for r in self.tracked_images if r[0] != line_no]
+        self.tracked_images.append(rec)
+        self._add_to_archive(line_no, pil_img)
+
+        if is_pdf:
+            self.pdf_images = [r for r in self.pdf_images if r[2] != line_no]
+            self.pdf_images.append(["img", None, line_no, pil_img, None, align])
+        if is_docs:
+            self.docs_images = [r for r in self.docs_images if r[2] != line_no]
+            self.docs_images.append(["img", None, line_no, pil_img, None, align])
+
+        self.on_editor_change()
+        return line_no
+
+    def _insert_image_on_new_line(self, pil_img, align="center", around_line=None,
+                                  is_pdf=False, is_docs=False):
+        if around_line is None:
+            return self._insert_image_inline(pil_img, align, is_pdf=is_pdf, is_docs=is_docs)
+
+        base_line = around_line
+        insert_line = base_line + 1
+        self.text.insert(f"{insert_line}.0", "\n")
+        insert_line = int(self.text.index(f"{insert_line}.0").split('.')[0])
+
+        for img_name in self.text.image_names():
+            idx = self.text.index(img_name)
+            if int(idx.split('.')[0]) == insert_line:
+                self.text.delete(idx)
+
+        img_tk = ImageTk.PhotoImage(pil_img)
+        self.tk_images.append(img_tk)
+        self.text.image_create(f"{insert_line}.0", image=img_tk)
+        self.text.insert(f"{insert_line + 1}.0", "\n")
+
+        rec = (insert_line, pil_img, align)
+        self.tracked_images = [r for r in self.tracked_images if r[0] != insert_line]
+        self.tracked_images.append(rec)
+        self._add_to_archive(insert_line, pil_img)
+
+        if is_pdf:
+            self.pdf_images = [r for r in self.pdf_images if r[2] != insert_line]
+            self.pdf_images.append(["img", None, insert_line, pil_img, None, align])
+        if is_docs:
+            self.docs_images = [r for r in self.docs_images if r[2] != insert_line]
+            self.docs_images.append(["img", None, insert_line, pil_img, None, align])
+
+        self.on_editor_change()
+        return insert_line
+
+    # ---------- reupload / paste ----------
+    def run_reupload_flow(self):
+        if not self.image_archive:
+            messagebox.showinfo("Archive", "No pages/images saved in archive.")
+            return
+        dlg = ArchiveDialog(self, self.image_archive)
+        self.wait_window(dlg)
+        entry = dlg.result
+        if not entry:
+            return
+        old_line = entry["line"]
+        path = filedialog.askopenfilename(
+            title=f"Select new image/PDF for line {old_line}",
+            filetypes=[
+                ("Images or PDF", "*.jpg *.jpeg *.png *.pdf"),
+                ("Image Files", "*.jpg *.jpeg *.png"),
+                ("PDF Files", "*.pdf"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        self.tracked_images = [r for r in self.tracked_images if r[0] != old_line]
+        self.pdf_images = [r for r in self.pdf_images if r[2] != old_line]
+        self.docs_images = [r for r in self.docs_images if r[2] != old_line]
+        self.image_archive = [e for e in self.image_archive if e["line"] != old_line]
+
+        if ext != ".pdf":
+            new_img = Image.open(path).convert("RGB")
+            target_w, target_h = entry["width"], entry["height"]
+            new_img = new_img.resize((target_w, target_h), Image.LANCZOS)
+            new_line = self._insert_image_on_new_line(new_img, "center",
+                                                      around_line=old_line,
+                                                      is_pdf=True)
+            self.status_text.set(f"Image reuploaded near line {old_line} (line {new_line}).")
+            return
+
+        with pdfplumber.open(path) as pdf:
+            if not pdf.pages:
+                messagebox.showerror("Error", "PDF has no pages.")
+                return
+            target_w, target_h = entry["width"], entry["height"]
+            insert_after = old_line
+            for page in pdf.pages:
+                page_img = page.to_image(resolution=300).original.convert("RGB")
+                page_img = page_img.resize((target_w, target_h), Image.LANCZOS)
+                insert_after = self._insert_image_on_new_line(
+                    page_img, "center", around_line=insert_after,
+                    is_pdf=True
+                )
+        self.status_text.set(f"Full PDF reuploaded near line {old_line}.")
+
+    def paste_image_from_clipboard(self):
         try:
-            start = self.text.index("sel.first")
-            end = self.text.index("sel.last")
-            for tag in ["bold", "italic", "underline", "left", "right", "center", "bullet"]:
-                self.text.tag_remove(tag, start, end)
-            self.text.tag_add("heading", start, end)
-        except tk.TclError:
-            messagebox.showinfo("Info", "Please select the text to make heading.")
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                messagebox.showinfo("Info", "Clipboard me koi image nahi hai.")
+                return
+            if img.width > 700:
+                img = img.resize((700, int(700 / img.width * img.height)), Image.LANCZOS)
+            new_line = self._insert_image_inline(img, "center")
+            self.status_text.set(f"Image pasted from clipboard on line {new_line}.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Clipboard se image paste nahi ho paya: {e}")
 
     def upload_image_file(self, place):
-        filepath = filedialog.askopenfilename(title=f"Select {place} (JPG/PNG)",
-                                              filetypes=[("Image Files", "*.jpg *.jpeg *.png")])
+        filepath = filedialog.askopenfilename(
+            title=f"Select {place} (JPG/PNG)",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
+        )
         if not filepath:
             return
         try:
@@ -626,9 +1089,496 @@ class GEMATCGenerator(tk.Tk):
 
         ResizeImageWindow(self, img_obj, callback, title=f"Resize {img_type}").focus()
 
+    def prompt_add_docs(self):
+        self.doc_list = filedialog.askopenfilenames(
+            title="Select Additional Documents (Images / Word / PDF)",
+            filetypes=[
+                ("Supported Files", "*.jpg *.jpeg *.png *.doc *.docx *.pdf"),
+                ("Image Files", "*.jpg *.jpeg *.png"),
+                ("Word Files", "*.doc *.docx"),
+                ("PDF Files", "*.pdf"),
+                ("All Files", "*.*"),
+            ]
+        )
+        if self.doc_list:
+            msg = f"{len(self.doc_list)} documents selected."
+            self.status_text.set(msg)
+            messagebox.showinfo("Documents", msg)
+
+    def _insert_single_image_doc(self, img):
+        self._insert_image_inline(img, "center", is_docs=True)
+
+    def _insert_pdf_file_as_images_at_cursor(self, pdf_path):
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                insert_after = None
+                for page in pdf.pages:
+                    img_page = page.to_image(resolution=400).original.convert("RGB")
+                    if img_page.width > 1000:
+                        h = int(img_page.height * (1000 / img_page.width))
+                        img_page = img_page.resize((1000, h), Image.LANCZOS)
+                    if insert_after is None:
+                        insert_after = self._insert_image_inline(
+                            img_page, "center", is_docs=True
+                        )
+                    else:
+                        insert_after = self._insert_image_on_new_line(
+                            img_page, "center", around_line=insert_after, is_docs=True
+                        )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to convert Doc PDF pages to images: {e}")
+
+    # ---------- Submit Docs with progress ----------
+    def insert_docs(self):
+        if not self.doc_list:
+            messagebox.showinfo("Info", "No documents selected.")
+            return
+
+        if not DOCX2PDF_AVAILABLE:
+            for p in self.doc_list:
+                if os.path.splitext(p)[1].lower() in (".doc", ".docx"):
+                    messagebox.showwarning(
+                        "docx2pdf missing",
+                        "Word files ko image ke roop me add karne ke liye 'pip install docx2pdf' install karna zaruri hai."
+                    )
+                    break
+
+        self.progress_var.set(0)
+        self.progress.config(mode="determinate")
+        self.wait_label.config(text="Please wait, inserting Add Docs...")
+        self.status_text.set("Inserting Add Docs as images...")
+
+        Thread(target=self.insert_docs_thread, daemon=True).start()
+
+    def insert_docs_thread(self):
+        total = len(self.doc_list)
+        num_images_inserted = 0
+
+        for idx, doc in enumerate(self.doc_list, start=1):
+            ext = os.path.splitext(doc)[1].lower()
+            try:
+                if ext in (".jpg", ".jpeg", ".png"):
+                    img = Image.open(doc).convert("RGB")
+                    if img.width > 700:
+                        img = img.resize(
+                            (700, int(700 / img.width * img.height)),
+                            Image.LANCZOS
+                        )
+                    self.after(0, self._insert_single_image_doc, img)
+                    num_images_inserted += 1
+
+                elif ext in (".doc", ".docx"):
+                    if DOCX2PDF_AVAILABLE:
+                        temp_pdf = os.path.join(
+                            self.temp_dir,
+                            f"word_conv_{os.path.basename(doc)}.pdf"
+                        )
+                        docx2pdf_convert(doc, temp_pdf)
+                        self.after(0, self._insert_pdf_file_as_images_at_cursor, temp_pdf)
+                        num_images_inserted += 1
+
+                elif ext == ".pdf":
+                    self.after(0, self._insert_pdf_file_as_images_at_cursor, doc)
+                    num_images_inserted += 1
+            except Exception as e:
+                self.after(0, lambda msg=str(e): messagebox.showerror("Error", f"Failed to insert document: {msg}"))
+
+            progress_val = (idx / total) * 100.0
+            self.after(0, self.progress_var.set, progress_val)
+
+        def finish():
+            msg = f"{num_images_inserted} documents added as images."
+            self.doc_list = []
+            self.status_text.set(msg)
+            self.wait_label.config(text="")
+            self.progress_var.set(0)
+            messagebox.showinfo("Success", msg)
+
+        self.after(0, finish)
+
+    def start_docs_pdf_paster(self):
+        filetypes = [("PDF or Image", "*.pdf *.jpg *.jpeg *.png"), ("All Files", "*.*")]
+        path = filedialog.askopenfilename(title="Select PDF/JPG for Paste", filetypes=filetypes)
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        self.progress_var.set(0)
+        self.progress.config(mode="determinate")
+        self.wait_label.config(text="Please Wait Fetching Data...")
+        self.status_text.set("Loading document pages as images...")
+        if ext == ".pdf":
+            Thread(target=self.docs_pdf_paster_thread, args=(path,), daemon=True).start()
+        else:
+            Thread(target=self.single_image_paster_thread, args=(path,), daemon=True).start()
+
+    def docs_pdf_paster_thread(self, pdf_path):
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages) or 1
+                for idx, page in enumerate(pdf.pages, start=1):
+                    img_page = page.to_image(resolution=400).original.convert("RGB")
+                    if img_page.width > 1000:
+                        h = int(img_page.height * (1000 / img_page.width))
+                        img_page = img_page.resize((1000, h), Image.LANCZOS)
+                    self.after(0, self._insert_pdf_page_image, img_page)
+                    progress_val = (idx / total_pages) * 100.0
+                    self.after(0, self.progress_var.set, progress_val)
+            self.after(0, self._pdf_paste_done)
+        except Exception as e:
+            def show_err():
+                messagebox.showerror("Error", f"Failed to paste PDF as images: {e}")
+                self.status_text.set("Error processing PDF.")
+                self.wait_label.config(text="")
+                self.progress_var.set(0)
+            self.after(0, show_err)
+
+    def single_image_paster_thread(self, img_path):
+        try:
+            img_page = Image.open(img_path).convert("RGB")
+            if img_page.width > 1000:
+                h = int(img_page.height * (1000 / img_page.width))
+                img_page = img_page.resize((1000, h), Image.LANCZOS)
+            self.after(0, self._insert_pdf_page_image, img_page)
+            self.after(0, self.progress_var.set, 100.0)
+            self.after(0, self._pdf_paste_done)
+        except Exception as e:
+            def show_err():
+                messagebox.showerror("Error", f"Failed to paste image as page: {e}")
+                self.status_text.set("Error processing image.")
+                self.wait_label.config(text="")
+                self.progress_var.set(0)
+            self.after(0, show_err)
+
+    def _insert_pdf_page_image(self, img_page):
+        end_line = int(self.text.index("end-1c").split('.')[0])
+        new_line = self._insert_image_on_new_line(
+            img_page, "center", around_line=end_line,
+            is_pdf=True
+        )
+        self.text.mark_set(tk.INSERT, f"{new_line + 1}.0")
+        self.on_editor_change()
+
+    def _pdf_paste_done(self):
+        self.status_text.set("Document pages pasted as images.")
+        self.wait_label.config(text="")
+        self.progress_var.set(0)
+        self.on_editor_change()
+
+    def pdf_paster_resize(self):
+        imgs = [i for i, item in enumerate(self.pdf_images) if item[0] == "img"]
+        if not imgs:
+            messagebox.showinfo("Info", "No pasted document (PDF/JPG) images to resize or delete.")
+            return
+        choice_win = tk.Toplevel(self)
+        choice_win.title("PDF Paster Actions")
+        choice_win.configure(bg="#23242e")
+        tk.Label(
+            choice_win, text="Choose action for PDF/JPG pages:",
+            bg="#23242e", fg="white",
+            font=("Arial", 10, "bold")
+        ).pack(padx=10, pady=(10, 5))
+        choice_var = tk.StringVar(value="resize")
+        tk.Radiobutton(
+            choice_win, text="Resize pages", value="resize",
+            variable=choice_var, bg="#23242e",
+            fg="white", selectcolor="#23242e"
+        ).pack(anchor="w", padx=15, pady=2)
+        tk.Radiobutton(
+            choice_win, text="Delete pages", value="delete",
+            variable=choice_var, bg="#23242e",
+            fg="white", selectcolor="#23242e"
+        ).pack(anchor="w", padx=15, pady=2)
+
+        def on_ok_choice():
+            choice_win.destroy()
+
+        tk.Button(
+            choice_win, text="OK", command=on_ok_choice,
+            bg="#006bce", fg="white"
+        ).pack(pady=8)
+        choice_win.transient(self)
+        choice_win.grab_set()
+        self.wait_window(choice_win)
+
+        if choice_var.get() == "resize":
+            dialog = ImageSelectDialog(self, imgs, title="Resize PDF/JPG Images")
+            self.wait_window(dialog)
+            choice = dialog.result
+            if not choice:
+                return
+            choice = choice.strip().lower()
+            if choice == "all":
+                first_img = self.pdf_images[imgs[0]][3]
+                ResizeImageWindow(
+                    self,
+                    first_img,
+                    lambda w, h: self._resize_all_pdf_images_keep_only_resized(w, h),
+                    title="Resize All PDF/JPG Images",
+                    bulk_option=True,
+                    enable_reupload=True
+                ).focus()
+            else:
+                try:
+                    selected_idx = int(choice.split()[-1]) - 1
+                    if selected_idx in imgs:
+                        self._launch_pdf_resize(selected_idx)
+                    else:
+                        messagebox.showerror("Error", f"Image {selected_idx + 1} not found.")
+                except Exception:
+                    messagebox.showerror("Error", "Invalid selection!")
+        elif choice_var.get() == "delete":
+            page_infos = []
+            for rec in self.pdf_images:
+                if rec[0] == "img" and rec[3] is not None:
+                    page_infos.append({"rec": rec, "line": rec[2]})
+            if not page_infos:
+                messagebox.showinfo("Info", "No PDF/JPG pages available to delete.")
+                return
+            dlg = DeletePagesDialog(self, page_infos, title="Delete Pages")
+            self.wait_window(dlg)
+            idxs = dlg.result_indices
+            if not idxs:
+                return
+            lines_to_remove = set()
+            new_pdf_images = []
+            for i, info in enumerate(page_infos):
+                if i in idxs:
+                    lines_to_remove.add(info["line"])
+                else:
+                    new_pdf_images.append(info["rec"])
+            self.pdf_images = new_pdf_images
+            for line in lines_to_remove:
+                to_delete = []
+                for img_name in self.text.image_names():
+                    idx = self.text.index(img_name)
+                    if int(idx.split('.')[0]) == line:
+                        to_delete.append(idx)
+                for idx in to_delete:
+                    self.text.delete(idx)
+            self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
+            self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
+            self.status_text.set(f"Deleted {len(lines_to_remove)} PDF/JPG pages.")
+            self.on_editor_change()
+
+    def _resize_all_pdf_images_keep_only_resized(self, width, height):
+        line_to_rec = {}
+        for rec_list in self.pdf_images:
+            if rec_list[0] == "img" and rec_list[3] is not None:
+                line_to_rec[rec_list[2]] = rec_list
+        new_pdf_images = []
+        new_tracked = []
+        for line, rec_list in sorted(line_to_rec.items()):
+            to_delete = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if int(idx.split('.')[0]) == line:
+                    to_delete.append(idx)
+            for idx in to_delete:
+                self.text.delete(idx)
+            resized_img = rec_list[3].resize((width, height), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(resized_img)
+            self.tk_images.append(img_tk)
+            index_str = f"{line}.0"
+            self.text.image_create(index_str, image=img_tk)
+            rec_list[3] = resized_img
+            new_pdf_images.append(rec_list)
+            new_tracked.append((line, resized_img, "center"))
+            self._update_archive_entry(line, resized_img)
+        self.pdf_images = new_pdf_images
+        self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
+        self.tracked_images.extend(new_tracked)
+        self.status_text.set("All document (PDF/JPG) images resized (no copies).")
+        self.on_editor_change()
+
+    def _launch_pdf_resize(self, index):
+        rec_list = self.pdf_images[index]
+        img_obj = rec_list[3]
+        line = rec_list[2]
+
+        def on_resize(resized_img):
+            to_delete = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if int(idx.split('.')[0]) == line:
+                    to_delete.append(idx)
+            for idx in to_delete:
+                self.text.delete(idx)
+            img_tk = ImageTk.PhotoImage(resized_img)
+            self.tk_images.append(img_tk)
+            index_str = f"{line}.0"
+            self.text.image_create(index_str, image=img_tk)
+            rec_list[3] = resized_img
+            self.tracked_images = [r for r in self.tracked_images if r[0] != line]
+            self.tracked_images.append((line, resized_img, "center"))
+            self._update_archive_entry(line, resized_img)
+            self.status_text.set("Selected document (PDF/JPG) image resized (single, no copies).")
+            self.on_editor_change()
+
+        ResizeImageWindow(self, img_obj, on_resize,
+                          title="Resize Document Image",
+                          enable_reupload=True).focus()
+
+    # ---------- RESIZE DOCS ----------
+    def resize_doc(self):
+        imgs = [i for i, item in enumerate(self.docs_images) if item[0] == "img"]
+        if not imgs:
+            messagebox.showinfo("Info", "No Add Docs images to resize or delete.")
+            return
+        choice_win = tk.Toplevel(self)
+        choice_win.title("Add Docs Actions")
+        choice_win.configure(bg="#23242e")
+        tk.Label(
+            choice_win, text="Choose action for Add Docs pages:",
+            bg="#23242e", fg="white",
+            font=("Arial", 10, "bold")
+        ).pack(padx=10, pady=(10, 5))
+        choice_var = tk.StringVar(value="resize")
+        tk.Radiobutton(
+            choice_win, text="Resize pages", value="resize",
+            variable=choice_var, bg="#23242e",
+            fg="white", selectcolor="#23242e"
+        ).pack(anchor="w", padx=15, pady=2)
+        tk.Radiobutton(
+            choice_win, text="Delete pages", value="delete",
+            variable=choice_var, bg="#23242e",
+            fg="white", selectcolor="#23242e"
+        ).pack(anchor="w", padx=15, pady=2)
+
+        def on_ok_choice():
+            choice_win.destroy()
+
+        tk.Button(
+            choice_win, text="OK", command=on_ok_choice,
+            bg="#006bce", fg="white"
+        ).pack(pady=8)
+        choice_win.transient(self)
+        choice_win.grab_set()
+        self.wait_window(choice_win)
+
+        if choice_var.get() == "resize":
+            dialog = ImageSelectDialog(self, imgs, title="Resize Add Docs Images")
+            self.wait_window(dialog)
+            choice = dialog.result
+            if not choice:
+                return
+            choice = choice.strip().lower()
+            if choice == "all":
+                first_img = self.docs_images[imgs[0]][3]
+                ResizeImageWindow(
+                    self,
+                    first_img,
+                    self._resize_all_docs_keep_only_resized,
+                    title="Resize All Add Docs Images",
+                    bulk_option=True,
+                    enable_reupload=True
+                ).focus()
+            else:
+                try:
+                    selected_idx = int(choice.split()[-1]) - 1
+                    if selected_idx in imgs:
+                        self._launch_doc_resize(selected_idx)
+                    else:
+                        messagebox.showerror("Error", f"Image {selected_idx + 1} not found.")
+                except Exception:
+                    messagebox.showerror("Error", "Invalid selection!")
+        elif choice_var.get() == "delete":
+            page_infos = []
+            for rec in self.docs_images:
+                if rec[0] == "img" and rec[3] is not None:
+                    page_infos.append({"rec": rec, "line": rec[2]})
+            if not page_infos:
+                messagebox.showinfo("Info", "No Add Docs pages available to delete.")
+                return
+            dlg = DeletePagesDialog(self, page_infos, title="Delete Add Docs Pages")
+            self.wait_window(dlg)
+            idxs = dlg.result_indices
+            if not idxs:
+                return
+            lines_to_remove = set()
+            new_docs_images = []
+            for i, info in enumerate(page_infos):
+                if i in idxs:
+                    lines_to_remove.add(info["line"])
+                else:
+                    new_docs_images.append(info["rec"])
+            self.docs_images = new_docs_images
+            for line in lines_to_remove:
+                to_delete = []
+                for img_name in self.text.image_names():
+                    idx = self.text.index(img_name)
+                    if int(idx.split('.')[0]) == line:
+                        to_delete.append(idx)
+                for idx in to_delete:
+                    self.text.delete(idx)
+            self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
+            self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
+            self.status_text.set(f"Deleted {len(lines_to_remove)} Add Docs pages.")
+            self.on_editor_change()
+
+    def _resize_all_docs_keep_only_resized(self, width, height):
+        line_to_rec = {}
+        for rec_list in self.docs_images:
+            if rec_list[0] == "img" and rec_list[3] is not None:
+                line_to_rec[rec_list[2]] = rec_list
+        new_docs_images = []
+        new_tracked = []
+        for line, rec_list in sorted(line_to_rec.items()):
+            to_delete = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if int(idx.split('.')[0]) == line:
+                    to_delete.append(idx)
+            for idx in to_delete:
+                self.text.delete(idx)
+            resized_img = rec_list[3].resize((width, height), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(resized_img)
+            self.tk_images.append(img_tk)
+            index_str = f"{line}.0"
+            self.text.image_create(index_str, image=img_tk)
+            rec_list[3] = resized_img
+            new_docs_images.append(rec_list)
+            new_tracked.append((line, resized_img, "center"))
+            self._update_archive_entry(line, resized_img)
+        self.docs_images = new_docs_images
+        self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
+        self.tracked_images.extend(new_tracked)
+        self.status_text.set("All Add Docs images resized (no copies).")
+        self.on_editor_change()
+
+    def _launch_doc_resize(self, index):
+        rec_list = self.docs_images[index]
+        line = rec_list[2]
+        img_obj = rec_list[3]
+
+        def on_resize(resized_img):
+            to_delete = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if int(idx.split('.')[0]) == line:
+                    to_delete.append(idx)
+            for idx in to_delete:
+                self.text.delete(idx)
+            img_tk = ImageTk.PhotoImage(resized_img)
+            self.tk_images.append(img_tk)
+            index_str = f"{line}.0"
+            self.text.image_create(index_str, image=img_tk)
+            rec_list[3] = resized_img
+            self.tracked_images = [r for r in self.tracked_images if r[0] != line]
+            self.tracked_images.append((line, resized_img, "center"))
+            self._update_archive_entry(line, resized_img)
+            self.status_text.set("Add Docs image resized (single, no copies).")
+            self.on_editor_change()
+
+        ResizeImageWindow(self, img_obj, on_resize,
+                          title="Resize Add Docs Image",
+                          enable_reupload=True).focus()
+
+    # ---------- T&C EXTRACT ----------
     def _extract_tc(self):
-        filepath = filedialog.askopenfilename(title="Select GEM Tender PDF",
-                                              filetypes=[("PDF Files", "*.pdf")])
+        filepath = filedialog.askopenfilename(
+            title="Select GEM Tender PDF",
+            filetypes=[("PDF Files", "*.pdf")]
+        )
         if not filepath:
             return
         self.status_text.set(f"Reading {os.path.basename(filepath)}...")
@@ -637,151 +1587,169 @@ class GEMATCGenerator(tk.Tk):
                 start_marker = "Buyer Added Bid Specific Terms and Conditions"
                 end_marker = "Disclaimer"
                 capture = False
-                tc_text = []
+                heading_inserted = False
+                self.text.delete("1.0", "end")
                 for page in pdf.pages:
-                    text = page.extract_text()
-                    if not text:
+                    page_text = page.extract_text() or ""
+                    if not page_text:
                         continue
-                    lines = text.split("\n")
-                    for line in lines:
+                    lines = page_text.split("\n")
+                    chars = page.chars
+                    lines_by_y = {}
+                    for ch in chars:
+                        y = round(ch["top"], 1)
+                        lines_by_y.setdefault(y, []).append(ch)
+                    bold_lines = set()
+                    for _, ch_list in lines_by_y.items():
+                        bold_count = sum(1 for c in ch_list if "Bold" in c.get("fontname", ""))
+                        if bold_count and bold_count / len(ch_list) > 0.6:
+                            text_here = "".join(c["text"] for c in ch_list).strip()
+                            if text_here:
+                                bold_lines.add(text_here)
+                    for raw_line in lines:
+                        line = raw_line.strip()
                         if start_marker in line:
                             capture = True
+                            if not heading_inserted:
+                                self.text.insert("end", "\n")
+                                h_start = self.text.index("end-1c")
+                                self.text.insert("end", start_marker + "\n")
+                                h_end = self.text.index("end-1c")
+                                self.text.tag_add("bold", h_start, h_end)
+                                self.text.insert("end", "\n")
+                                heading_inserted = True
+                            continue
                         if capture and end_marker in line:
                             capture = False
                             break
-                        if capture:
-                            tc_text.append(line)
-                self.text.delete("1.0", "end")
-                for line in tc_text:
-                    line = line.lstrip()
-                    if line.startswith("/Buyer Added"):
-                        line = line[1:].lstrip()
-                    if not is_garbage(line):
-                        self.text.insert("end", line + "\n")
-                msg = "Terms & Conditions extracted."
-                self.status_text.set(msg)
-                messagebox.showinfo("Success", msg)
+                        if not capture:
+                            continue
+                        if is_probable_page_number(line):
+                            continue
+                        if not line:
+                            continue
+                        if is_garbage(line):
+                            continue
+                        is_bold_heading = False
+                        for b in bold_lines:
+                            if line.startswith(b) or b.startswith(line):
+                                is_bold_heading = True
+                                break
+                        if is_bold_heading:
+                            self.text.insert("end", "\n")
+                            start_idx = self.text.index("end-1c")
+                            self.text.insert("end", line + "\n")
+                            end_idx = self.text.index("end-1c")
+                            self.text.tag_add("bold", start_idx, end_idx)
+                            self.text.insert("end", "\n")
+                        else:
+                            self.text.insert("end", line + "\n")
+                self.status_text.set("Terms & Conditions extracted.")
+                messagebox.showinfo("Success", "Terms & Conditions extracted successfully.")
+                self.on_editor_change()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read PDF: {e}")
             self.status_text.set("Error reading PDF.")
 
-    def prompt_add_docs(self):
-        self.doc_list = filedialog.askopenfilenames(
-            title="Select Additional Documents (JPG/PNG)",
-            filetypes=[("Image Files", "*.jpg *.jpeg *.png")])
-        if self.doc_list:
-            msg = f"{len(self.doc_list)} documents selected."
-            self.status_text.set(msg)
-            messagebox.showinfo("Documents", msg)
-
-    def insert_docs(self):
-        if not self.doc_list:
-            messagebox.showinfo("Info", "No documents selected.")
-            return
-        num_inserted = 0
-        pos = self.last_cursor_pos
-        for doc in self.doc_list:
-            ext = os.path.splitext(doc)[1].lower()
-            if ext in (".jpg", ".jpeg", ".png"):
-                try:
-                    img = Image.open(doc)
-                    if img.width > 600:
-                        img = img.resize((600, int(600 / img.width * img.height)),
-                                         Image.LANCZOS)
-                    img_tk = ImageTk.PhotoImage(img)
-                    self.tk_images.append(img_tk)
-                    line = int(self.text.index(pos).split('.')[0])
-                    index_str = f"{line}.0"
-                    slot_name = self.text.image_create(index_str, image=img_tk)
-                    rec = ["img", doc, line, img, slot_name, "center"]
-                    self.tracked_images.append(rec)
-                    self.text.insert(f"{line+1}.0", "\n")
-                    num_inserted += 1
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to insert image: {e}")
-                    self.status_text.set("Failed to insert image")
-        msg = f"{num_inserted} documents added."
-        self.doc_list = []
-        self.status_text.set(msg)
-        messagebox.showinfo("Success", msg)
-
-    def export_to_pdf(self):
-        output_path = filedialog.asksaveasfilename(defaultextension=".pdf",
-                                                   filetypes=[("PDF Files", "*.pdf")],
-                                                   title="Save ATC as PDF")
-        if not output_path:
-            return
-        Thread(target=self._pdf_preview_render, args=(output_path,), daemon=True).start()
-        self.status_text.set(f"PDF exported to {output_path}")
-        messagebox.showinfo("Success", "PDF has been exported successfully.")
-
-    def clear_all(self):
-        self.text.delete("1.0", "end")
-        self.doc_list = []
-        self.tk_images = []
-        self.tracked_images = []
-        self.pdf_images = []
-        self.header_img_resized = None
-        self.footer_img_resized = None
-        self.last_cursor_pos = "1.0"
-        self.status_text.set("Document cleared.")
-        self.text_sizes = {}
-        if self.temp_dir and os.path.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir)
-            self.temp_dir = tempfile.mkdtemp()
-
-    def show_preview(self):
-        messagebox.showinfo("Info", "Preview PDF feature is implemented in PDF export only.")
-
-    def _pdf_preview_render(self, output_file="preview_temp.pdf"):
+    # ---------- EXPORT ENGINE with image page rule ----------
+    def _pdf_preview_render(self, output_file="preview_temp.pdf", show_message=True):
         styles = getSampleStyleSheet()
         heading_style = lambda sz: ParagraphStyle(
             name=f'TCHeading{sz}', parent=styles['Heading2'],
             alignment=TA_CENTER, fontName=self.bold_font_name,
-            fontSize=sz, spaceAfter=12)
+            fontSize=sz, spaceAfter=6, spaceBefore=12
+        )
         normal_style = lambda sz: ParagraphStyle(
             name=f'TCLine{sz}', parent=styles['Normal'],
             fontName=self.font_name, fontSize=sz,
-            spaceAfter=5, alignment=TA_LEFT)
+            leading=sz + 3, spaceBefore=4, spaceAfter=2,
+            alignment=TA_LEFT
+        )
 
-        frame_width = A4[0] - (40 + 40)
-        frame_height = A4[1] - (self.page_margin_top + self.page_margin_bottom)
-        max_img_width = frame_width * 0.98
-        max_img_height = frame_height * 0.4
+        frame_left = 40
+        content_top_offset = 160
+        footer_safe_height = 120
+        frame_width = A4[0] - (frame_left + 40)
+        frame_height = A4[1] - (content_top_offset + self.page_margin_bottom + footer_safe_height)
 
         elems = []
+
         total_lines = int(self.text.index('end-1c').split('.')[0])
-        for i in range(1, total_lines + 1):
+
+        images_by_line = {}
+        for line, pil_img, align in self.tracked_images:
+            images_by_line.setdefault(line, []).append((pil_img, align))
+
+        usable_w = frame_width * 0.95
+        usable_h = frame_height * 0.85
+
+        current_page_line_count = 0
+        max_lines_per_page = int(frame_height / self.line_height)
+
+        i = 1
+        while i <= total_lines:
             line_text = self.text.get(f"{i}.0", f"{i}.0 lineend").strip()
-            if not line_text:
-                continue
             tags = self.text.tag_names(f"{i}.0")
-            size = 12
-            for tag in tags:
-                if tag.startswith("size_"):
-                    size = int(tag.split("_")[1])
-            paragraph_style = normal_style(size)
-            if "heading" in tags:
-                paragraph_style = heading_style(size)
-            elems.append(Paragraph(line_text, paragraph_style))
 
-        for rec in self.tracked_images:
-            if rec[0] == "img" and rec[3] is not None:
-                img, align_tag = rec[3], rec[5]
-                img_path = os.path.join(self.temp_dir, f"docimg_{id(img)}.png")
-                img.save(img_path)
-                real_width, real_height = img.size
-                scale_ratio = min(max_img_width/real_width, max_img_height/real_height, 1.0)
-                final_width = int(real_width * scale_ratio)
-                final_height = int(real_height * scale_ratio)
-                RLimg = RLImage(img_path, width=final_width, height=final_height)
-                RLimg.hAlign = align_tag.upper() if align_tag in ("left","right","center") else 'CENTER'
-                elems.append(RLimg)
-                elems.append(Spacer(1, 14))
+            if i in images_by_line:
+                if current_page_line_count > 0:
+                    elems.append(PageBreak())
+                    current_page_line_count = 0
 
-        frame_margin_left = 40
-        frame_margin_bottom = self.page_margin_bottom
-        frame = Frame(frame_margin_left, frame_margin_bottom,
+                for pil_img, align_tag in images_by_line[i]:
+                    img_path = os.path.join(self.temp_dir, f"docimg_{id(pil_img)}.png")
+                    pil_img.save(img_path, format="PNG")
+                    real_w, real_h = pil_img.size
+                    ratio = min(usable_w / real_w, usable_h / real_h, 0.95)
+                    RLimg = RLImage(
+                        img_path,
+                        width=real_w * ratio,
+                        height=real_h * ratio
+                    )
+                    RLimg.hAlign = align_tag.upper() if align_tag in ("left", "right", "center") else 'CENTER'
+                    elems.append(Spacer(1, 6))
+                    elems.append(RLimg)
+                    elems.append(Spacer(1, 6))
+
+                elems.append(PageBreak())
+                current_page_line_count = 0
+                i += 1
+                continue
+
+            if line_text:
+                size = 12
+                for tag in tags:
+                    if tag.startswith("size_"):
+                        size = int(tag.split("_")[1])
+
+                if "heading" in tags:
+                    style = heading_style(size)
+                else:
+                    style = normal_style(size)
+                    if "center" in tags:
+                        style.alignment = TA_CENTER
+                    elif "right" in tags:
+                        style.alignment = TA_RIGHT
+                    else:
+                        style.alignment = TA_LEFT
+                    if "bold" in tags:
+                        style.fontName = self.bold_font_name
+
+                elems.append(Paragraph(line_text, style))
+                current_page_line_count += 1
+
+                if current_page_line_count >= max_lines_per_page:
+                    elems.append(PageBreak())
+                    current_page_line_count = 0
+
+            i += 1
+
+        if not elems:
+            open(output_file, "wb").close()
+            return
+
+        frame_margin_bottom = self.page_margin_bottom + footer_safe_height
+        frame = Frame(frame_left, frame_margin_bottom,
                       frame_width, frame_height, id='bodyframe')
         template = PageTemplate(id='geatc', frames=[frame], onPage=self.on_page)
         doc = BaseDocTemplate(output_file, pagesize=A4, pageTemplates=[template])
@@ -796,9 +1764,11 @@ class GEMATCGenerator(tk.Tk):
             scaled_width = int(img_width * scale)
             scaled_height = int(img_height * scale)
             x_pos = (pdf_width - scaled_width) / 2
-            y_pos = pdf_height - scaled_height - 10
-            canvas.drawImage(ImageReader(self.header_img_resized), x_pos, y_pos,
-                             width=scaled_width, height=scaled_height, preserveAspectRatio=True)
+            y_pos = pdf_height - scaled_height - 20
+            canvas.drawImage(
+                ImageReader(self.header_img_resized), x_pos, y_pos,
+                width=scaled_width, height=scaled_height, preserveAspectRatio=True
+            )
         if self.footer_img_resized is not None:
             img_width, img_height = self.footer_img_resized.size
             available_width = pdf_width - 100
@@ -806,9 +1776,35 @@ class GEMATCGenerator(tk.Tk):
             scaled_width = int(img_width * scale)
             scaled_height = int(img_height * scale)
             x_pos = 40
-            y_pos = 15
-            canvas.drawImage(ImageReader(self.footer_img_resized), x_pos, y_pos,
-                             width=scaled_width, height=scaled_height, preserveAspectRatio=True)
+            y_pos = self.page_margin_bottom
+            canvas.drawImage(
+                ImageReader(self.footer_img_resized), x_pos, y_pos,
+                width=scaled_width, height=scaled_height, preserveAspectRatio=True
+            )
+
+    def clear_all(self):
+        self.text.delete("1.0", "end")
+        self.doc_list = []
+        self.tk_images = []
+        self.tracked_images = []
+        self.pdf_images = []
+        self.docs_images = []
+        self.image_archive = []
+        self.header_img_resized = None
+        self.footer_img_resized = None
+        self.last_cursor_pos = "1.0"
+        self.status_text.set("Document cleared.")
+        self.text_sizes = {}
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+            self.temp_dir = tempfile.mkdtemp()
+        for child in self.preview_inner.winfo_children():
+            child.destroy()
+        self.preview_pages_tk.clear()
+        self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
+        self.on_editor_change()
+
+
 if __name__ == "__main__":
     app = GEMATCGenerator()
     app.mainloop()
