@@ -12,15 +12,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
     BaseDocTemplate, PageTemplate, Frame,
-    Paragraph, Spacer, Image as RLImage, KeepTogether, PageBreak
+    Paragraph, Spacer, Image as RLImage, PageBreak
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+
 
 def resource_path(rel_path):
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, rel_path)
     return os.path.abspath(rel_path)
+
 
 POPPLER_PATH = resource_path("poppler_bin")
 POPPLER_PATH = r"C:\Users\ASUS\AppData\Local\Programs\Python\Python312\Scripts\poppler-25.12.0\Library\bin"
@@ -479,9 +481,7 @@ class GEMATCGenerator(tk.Tk):
         self.target_size_mb = tk.DoubleVar(value=10.0)
         self.target_size_unit = tk.StringVar(value="MB")
 
-        # NEW: fast export cache
         self.fast_img_cache = {}       # key = id(PIL), value = (path, (w,h))
-        self.fast_img_seq = []         # ordered list of (pil_img, align)
 
         # ---------- TOP BAR ----------
         top_bar = tk.Frame(self, bg="#23242e")
@@ -653,8 +653,15 @@ class GEMATCGenerator(tk.Tk):
         self.text.tag_config("heading", font=(self.font_name, 17, "bold"),
                              justify="center", spacing1=14, spacing3=12)
 
-        tk.Label(right_panel, text="PDF Preview", bg="#181820", fg="#e5e7eb",
-                 font=("Arial", 11, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
+        # Right panel header with page count
+        header_frame = tk.Frame(right_panel, bg="#181820")
+        header_frame.pack(fill="x", pady=(4, 2))
+        tk.Label(header_frame, text="PDF Preview", bg="#181820",
+                 fg="#e5e7eb", font=("Arial", 11, "bold")).pack(side="left", padx=6)
+        self.page_info_var = tk.StringVar(value="Pages: 0")
+        tk.Label(header_frame, textvariable=self.page_info_var,
+                 bg="#181820", fg="#a5b4fc",
+                 font=("Arial", 10, "bold")).pack(side="right", padx=6)
 
         self.preview_canvas = tk.Canvas(
             right_panel,
@@ -716,7 +723,7 @@ class GEMATCGenerator(tk.Tk):
         if not PDF2IMAGE_AVAILABLE:
             self.status_text.set("Preview disabled (install pdf2image for live preview).")
 
-    # -------- helper: auto fg from bg --------
+    # ---------- helpers ----------
     def auto_contrast_fg(self, hex_color):
         try:
             hex_color = hex_color.lstrip("#")
@@ -765,7 +772,6 @@ class GEMATCGenerator(tk.Tk):
         )
         self.status_text.set("Text area colors updated with readable contrast.")
 
-    # -------- BACKSPACE image full remove --------
     def on_key(self, event):
         if event.keysym != "BackSpace":
             return
@@ -785,9 +791,6 @@ class GEMATCGenerator(tk.Tk):
                 self.pdf_images = [r for r in self.pdf_images if r[2] != cur_line]
                 self.docs_images = [r for r in self.docs_images if r[2] != cur_line]
                 self.image_archive = [e for e in self.image_archive if e["line"] != cur_line]
-                # cache se bhi nikaalo
-                self.fast_img_seq = [p for p in self.fast_img_seq if p[0] not in
-                                     [r[1] for r in self.tracked_images]]
                 self.status_text.set(f"Image/slide permanently removed from line {cur_line}.")
                 self.on_editor_change()
                 return "break"
@@ -940,9 +943,7 @@ class GEMATCGenerator(tk.Tk):
                 return
         self._add_to_archive(line, new_img)
 
-    # ---------- helper: fast cache ----------
     def _cache_image_once(self, pil_img):
-        """Ek PIL image ke liye ek hi baar disk file banao; baad me sirf reuse."""
         key = id(pil_img)
         if key in self.fast_img_cache:
             return self.fast_img_cache[key]
@@ -951,14 +952,7 @@ class GEMATCGenerator(tk.Tk):
         self.fast_img_cache[key] = (path, pil_img.size)
         return self.fast_img_cache[key]
 
-    def _rebuild_fast_sequence(self):
-        """tracked_images se ordered sequence banao, taaki export ek pass me ho."""
-        self.fast_img_seq = sorted(
-            [(img, align) for _, img, align in self.tracked_images],
-            key=lambda x: id(x[0])
-        )
-
-    # ---------- image insert helpers ----------
+    # ---------- image insert ----------
     def _insert_image_inline(self, pil_img, align="center",
                              is_pdf=False, is_docs=False):
         insert_index = self.text.index("insert")
@@ -989,7 +983,6 @@ class GEMATCGenerator(tk.Tk):
             self.docs_images = [r for r in self.docs_images if r[2] != line_no]
             self.docs_images.append(["img", None, line_no, pil_img, None, align])
 
-        self._rebuild_fast_sequence()
         self.on_editor_change()
         return line_no
 
@@ -1019,11 +1012,10 @@ class GEMATCGenerator(tk.Tk):
             self.docs_images = [r for r in self.docs_images if r[2] != insert_line]
             self.docs_images.append(["img", None, insert_line, pil_img, None, align])
 
-        self._rebuild_fast_sequence()
         self.on_editor_change()
         return insert_line
 
-    # ---------- paste image: docs-style ----------
+    # ---------- paste image ----------
     def paste_image_from_clipboard(self):
         try:
             img = ImageGrab.grabclipboard()
@@ -1038,6 +1030,7 @@ class GEMATCGenerator(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"Clipboard se image paste nahi ho paya: {e}")
 
+    # ---------- header/footer ----------
     def upload_image_file(self, place):
         filepath = filedialog.askopenfilename(
             title=f"Select {place} (JPG/PNG)",
@@ -1069,7 +1062,7 @@ class GEMATCGenerator(tk.Tk):
 
         ResizeImageWindow(self, img_obj, callback, title=f"Resize {img_type}").focus()
 
-    # ---------- UPDATED reupload flow ----------
+    # ---------- reupload ----------
     def run_reupload_flow(self):
         if not self.image_archive:
             messagebox.showinfo("Archive", "No pages/images saved in archive.")
@@ -1097,7 +1090,6 @@ class GEMATCGenerator(tk.Tk):
         self.pdf_images = [r for r in self.pdf_images if r[2] != old_line]
         self.docs_images = [r for r in self.docs_images if r[2] != old_line]
         self.image_archive = [e for e in self.image_archive if e["line"] != old_line]
-        self._rebuild_fast_sequence()
 
         path = filedialog.askopenfilename(
             title=f"Select new image/PDF for line {old_line}",
@@ -1415,7 +1407,6 @@ class GEMATCGenerator(tk.Tk):
                     self.text.delete(idx)
             self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
             self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
-            self._rebuild_fast_sequence()
             self.status_text.set(f"Deleted {len(lines_to_remove)} PDF/JPG pages.")
             self.on_editor_change()
 
@@ -1446,7 +1437,6 @@ class GEMATCGenerator(tk.Tk):
         self.pdf_images = new_pdf_images
         self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
         self.tracked_images.extend(new_tracked)
-        self._rebuild_fast_sequence()
         self.status_text.set("All document (PDF/JPG) images resized (no copies).")
         self.on_editor_change()
 
@@ -1471,7 +1461,6 @@ class GEMATCGenerator(tk.Tk):
             self.tracked_images = [r for r in self.tracked_images if r[0] != line]
             self.tracked_images.append((line, resized_img, "center"))
             self._update_archive_entry(line, resized_img)
-            self._rebuild_fast_sequence()
             self.status_text.set("Selected document (PDF/JPG) image resized (single, no copies).")
             self.on_editor_change()
 
@@ -1573,7 +1562,6 @@ class GEMATCGenerator(tk.Tk):
                     self.text.delete(idx)
             self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
             self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
-            self._rebuild_fast_sequence()
             self.status_text.set(f"Deleted {len(lines_to_remove)} Add Docs pages.")
             self.on_editor_change()
 
@@ -1604,7 +1592,6 @@ class GEMATCGenerator(tk.Tk):
         self.docs_images = new_docs_images
         self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
         self.tracked_images.extend(new_tracked)
-        self._rebuild_fast_sequence()
         self.status_text.set("All Add Docs images resized (no copies).")
         self.on_editor_change()
 
@@ -1629,7 +1616,6 @@ class GEMATCGenerator(tk.Tk):
             self.tracked_images = [r for r in self.tracked_images if r[0] != line]
             self.tracked_images.append((line, resized_img, "center"))
             self._update_archive_entry(line, resized_img)
-            self._rebuild_fast_sequence()
             self.status_text.set("Add Docs image resized (single, no copies).")
             self.on_editor_change()
 
@@ -1637,7 +1623,7 @@ class GEMATCGenerator(tk.Tk):
                           title="Resize Add Docs Image",
                           enable_reupload=True).focus()
 
-    # ---------- extract T&C ----------
+    # ---------- T&C extract ----------
     def _extract_tc(self):
         filepath = filedialog.askopenfilename(
             title="Select GEM Tender PDF",
@@ -1715,7 +1701,7 @@ class GEMATCGenerator(tk.Tk):
             messagebox.showerror("Error", f"Failed to read PDF: {e}")
             self.status_text.set("Error reading PDF.")
 
-    # ---------- preview / export / compress ----------
+    # ---------- Preview / Export ----------
     def manual_preview_click(self):
         if not PDF2IMAGE_AVAILABLE:
             messagebox.showwarning(
@@ -1726,11 +1712,10 @@ class GEMATCGenerator(tk.Tk):
         if self.preview_thread and self.preview_thread.is_alive():
             messagebox.showinfo("Preview", "Preview already running, please wait.")
             return
-        self.progress.config(mode="indeterminate")
+        self.progress.config(mode="determinate")
         self.progress_var.set(0)
         self.wait_label.config(text="Generating preview, please wait...")
         self.status_text.set("Generating preview PDF...")
-        self.progress.start(10)
         self.preview_thread = Thread(target=self._preview_worker, daemon=True)
         self.preview_thread.start()
 
@@ -1747,29 +1732,46 @@ class GEMATCGenerator(tk.Tk):
                 except Exception:
                     pages = []
 
+                total_pages = len(pages)
+
                 def update_preview():
                     for child in self.preview_inner.winfo_children():
                         child.destroy()
                     self.preview_pages_tk.clear()
                     if not pages:
                         self.status_text.set("Preview image not available yet.")
+                        self.page_info_var.set("Pages: 0")
                     else:
                         target_w = 500
                         a4_w, a4_h = A4
                         aspect = a4_h / a4_w
                         target_h = int(target_w * aspect)
-                        for img in pages:
+                        for idx, img in enumerate(pages, start=1):
                             img = img.convert("RGB")
                             img_resized = img.resize((target_w, target_h), Image.LANCZOS)
                             tkimg = ImageTk.PhotoImage(img_resized)
                             self.preview_pages_tk.append(tkimg)
-                            lbl = tk.Label(self.preview_inner, image=tkimg, bg="#111827")
-                            lbl.pack(pady=8)
+
+                            frame = tk.Frame(self.preview_inner, bg="#111827")
+                            frame.pack(pady=6, fill="x")
+
+                            lbl_page = tk.Label(
+                                frame,
+                                text=f"Page {idx} / {total_pages}",
+                                bg="#111827",
+                                fg="#a5b4fc",
+                                font=("Arial", 9, "bold")
+                            )
+                            lbl_page.pack(anchor="w", padx=4, pady=(0, 2))
+
+                            lbl_img = tk.Label(frame, image=tkimg, bg="#111827")
+                            lbl_img.pack()
+
                         self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
                         self.status_text.set("Preview ready.")
-                    self.progress.stop()
-                    self.progress_var.set(0)
-                    self.progress.config(mode="determinate")
+                        self.page_info_var.set(f"Pages: {total_pages}")
+
+                    self.progress_var.set(100)
                     self.wait_label.config(text="")
                 self.after(0, update_preview)
             else:
@@ -1778,18 +1780,15 @@ class GEMATCGenerator(tk.Tk):
                         child.destroy()
                     self.preview_pages_tk.clear()
                     self.status_text.set("No content to preview.")
-                    self.progress.stop()
+                    self.page_info_var.set("Pages: 0")
                     self.progress_var.set(0)
-                    self.progress.config(mode="determinate")
                     self.wait_label.config(text="")
                 self.after(0, no_content)
         except Exception as e:
             def show_err():
                 self.status_text.set("Error while generating preview.")
                 messagebox.showerror("Preview Error", f"Preview failed: {e}")
-                self.progress.stop()
                 self.progress_var.set(0)
-                self.progress.config(mode="determinate")
                 self.wait_label.config(text="")
             self.after(0, show_err)
 
@@ -1804,32 +1803,130 @@ class GEMATCGenerator(tk.Tk):
         if self.export_thread and self.export_thread.is_alive():
             messagebox.showinfo("Export", "Export already running, please wait.")
             return
-        self.progress.config(mode="indeterminate")
+        self.progress.config(mode="determinate")
         self.progress_var.set(0)
         self.wait_label.config(text="Exporting PDF, please wait...")
         self.status_text.set(f"Exporting to {output_path} ...")
-        self.progress.start(10)
         self.export_thread = Thread(target=self._export_worker, args=(output_path,), daemon=True)
         self.export_thread.start()
 
     def _export_worker(self, output_file):
         try:
-            self._pdf_preview_render(output_file, show_message=False)
+            # yahan text lines ko approx count karke simple progress dikhayenge
+            total_lines = int(self.text.index('end-1c').split('.')[0])
+            images_by_line = {}
+            for line, pil_img, align in self.tracked_images:
+                images_by_line.setdefault(line, []).append((pil_img, align))
+            total_items = total_lines + len(images_by_line) + 1
+            progress_step = max(1, 100 // total_items)
+
+            styles = getSampleStyleSheet()
+            heading_style = lambda sz: ParagraphStyle(
+                name=f'TCHeading{sz}', parent=styles['Heading2'],
+                alignment=TA_CENTER, fontName=self.bold_font_name,
+                fontSize=sz, spaceAfter=6, spaceBefore=12
+            )
+            normal_style = lambda sz: ParagraphStyle(
+                name=f'TCLine{sz}', parent=styles['Normal'],
+                fontName=self.font_name, fontSize=sz,
+                leading=sz + 3, spaceBefore=4, spaceAfter=2,
+                alignment=TA_LEFT
+            )
+
+            frame_left = 40
+            content_top_offset = 160
+            footer_safe_height = 120
+            frame_width = A4[0] - (frame_left + 40)
+            frame_height = A4[1] - (content_top_offset + self.page_margin_bottom + footer_safe_height)
+
+            elems = []
+            usable_w = frame_width * 0.95
+            usable_h = frame_height * 0.85
+
+            current_page_line_count = 0
+            max_lines_per_page = int(frame_height / self.line_height)
+
+            i = 1
+            done_items = 0
+            while i <= total_lines:
+                line_text = self.text.get(f"{i}.0", f"{i}.0 lineend").strip()
+                tags = self.text.tag_names(f"{i}.0")
+
+                if i in images_by_line:
+                    if current_page_line_count > 0:
+                        elems.append(PageBreak())
+                        current_page_line_count = 0
+                    for pil_img, align_tag in images_by_line[i]:
+                        img_path, (real_w, real_h) = self._cache_image_once(pil_img)
+                        ratio = min(usable_w / real_w, usable_h / real_h, 0.95)
+                        img_w = real_w * ratio
+                        img_h = real_h * ratio
+                        rl_img = RLImage(img_path, width=img_w, height=img_h)
+                        rl_img.hAlign = align_tag.upper() if align_tag in ("left", "right", "center") else 'CENTER'
+                        rl_img._restrictSize(usable_w, usable_h)
+                        elems.append(Spacer(1, 6))
+                        elems.append(rl_img)
+                        elems.append(Spacer(1, 6))
+                        done_items += 1
+                        self.after(0, self.progress_var.set,
+                                   min(100, done_items * progress_step))
+                    elems.append(PageBreak())
+                    current_page_line_count = 0
+                    i += 1
+                    continue
+
+                if line_text:
+                    size = 12
+                    for tag in tags:
+                        if tag.startswith("size_"):
+                            size = int(tag.split("_")[1])
+
+                    if "heading" in tags:
+                        style = heading_style(size)
+                    else:
+                        style = normal_style(size)
+                        if "center" in tags:
+                            style.alignment = TA_CENTER
+                        elif "right" in tags:
+                            style.alignment = TA_RIGHT
+                        else:
+                            style.alignment = TA_LEFT
+                        if "bold" in tags:
+                            style.fontName = self.bold_font_name
+
+                    elems.append(Paragraph(line_text, style))
+                    current_page_line_count += 1
+                    done_items += 1
+                    self.after(0, self.progress_var.set,
+                               min(100, done_items * progress_step))
+
+                    if current_page_line_count >= max_lines_per_page:
+                        elems.append(PageBreak())
+                        current_page_line_count = 0
+
+                i += 1
+
+            if not elems:
+                open(output_file, "wb").close()
+            else:
+                frame_margin_bottom = self.page_margin_bottom + 120
+                frame = Frame(frame_left, frame_margin_bottom,
+                              frame_width, frame_height, id='bodyframe')
+                template = PageTemplate(id='geatc', frames=[frame], onPage=self.on_page)
+                doc = BaseDocTemplate(output_file, pagesize=A4, pageTemplates=[template])
+                doc.build(elems)
+
             def done():
+                self.progress_var.set(100)
+                self.wait_label.config(text="")
                 self.status_text.set(f"PDF exported: {output_file}")
                 messagebox.showinfo("Success", "PDF has been exported successfully.")
-                self.progress.stop()
-                self.progress_var.set(0)
-                self.progress.config(mode="determinate")
-                self.wait_label.config(text="")
             self.after(0, done)
         except Exception as e:
             def show_err():
                 self.status_text.set("Error exporting PDF.")
                 messagebox.showerror("Export Error", f"PDF export failed: {e}")
-                self.progress.stop()
                 self.progress_var.set(0)
-                self.progress.config(mode="determinate")
                 self.wait_label.config(text="")
             self.after(0, show_err)
 
@@ -1863,11 +1960,10 @@ class GEMATCGenerator(tk.Tk):
         else:
             target_bytes = int(target_val * 1024)
 
-        self.progress.config(mode="indeterminate")
+        self.progress.config(mode="determinate")
         self.progress_var.set(0)
         self.wait_label.config(text="Compressing PDF, please wait...")
         self.status_text.set("Trying to compress PDF near selected size...")
-        self.progress.start(10)
 
         t = Thread(target=self._compress_worker,
                    args=(tmp_pdf, save_path, target_bytes),
@@ -1880,20 +1976,21 @@ class GEMATCGenerator(tk.Tk):
             from reportlab.lib.utils import ImageReader
             from pdf2image import convert_from_path
 
-            qualities = [95, 85, 75, 60, 50, 40, 30]
-            best_path = None
-            best_size = None
-
             kwargs = {}
             if POPPLER_PATH:
                 kwargs["poppler_path"] = POPPLER_PATH
             pages = convert_from_path(src_pdf, dpi=150, **kwargs)
+            total_pages = len(pages) or 1
 
-            for q in qualities:
+            qualities = [95, 85, 75, 60, 50, 40, 30]
+            best_path = None
+            best_size = None
+
+            for q_idx, q in enumerate(qualities, start=1):
                 tmp_out = os.path.join(self.temp_dir, f"compress_q{q}.pdf")
                 c = rl_canvas.Canvas(tmp_out, pagesize=A4)
                 pw, ph = A4
-                for img in pages:
+                for p_idx, img in enumerate(pages, start=1):
                     buf = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
                     buf_name = buf.name
                     buf.close()
@@ -1907,6 +2004,10 @@ class GEMATCGenerator(tk.Tk):
                     c.drawImage(ImageReader(page_img), x, y, width=nw, height=nh)
                     c.showPage()
                     os.remove(buf_name)
+                    # page level progress
+                    progress = ((p_idx + (q_idx - 1) * total_pages) /
+                                (total_pages * len(qualities))) * 100
+                    self.after(0, self.progress_var.set, progress)
                 c.save()
 
                 sz = os.path.getsize(tmp_out)
@@ -1922,10 +2023,6 @@ class GEMATCGenerator(tk.Tk):
                 shutil.copy(best_path, dst_pdf)
 
             def done():
-                self.progress.stop()
-                self.progress_var.set(0)
-                self.progress.config(mode="determinate")
-                self.wait_label.config(text="")
                 if best_path and os.path.exists(dst_pdf):
                     final_kb = os.path.getsize(dst_pdf) / 1024
                     self.status_text.set(f"Compressed PDF saved (~{final_kb:.1f} KB).")
@@ -1936,20 +2033,19 @@ class GEMATCGenerator(tk.Tk):
                 else:
                     self.status_text.set("Compression failed.")
                     messagebox.showerror("Error", "Could not compress PDF.")
+                self.progress_var.set(0)
+                self.wait_label.config(text="")
             self.after(0, done)
         except Exception as e:
             def show_err():
-                self.progress.stop()
                 self.progress_var.set(0)
-                self.progress.config(mode="determinate")
                 self.wait_label.config(text="")
                 self.status_text.set("Error during compression.")
                 messagebox.showerror("Error", f"Compression failed: {e}")
             self.after(0, show_err)
 
-    # ---------- FAST RENDER ----------
+    # ---------- fast render for preview ----------
     def _pdf_preview_render(self, output_file="preview_temp.pdf", show_message=True):
-        """Fast render: har image ek hi baar disk par save + reuse, no repeated heavy operations."""
         styles = getSampleStyleSheet()
         heading_style = lambda sz: ParagraphStyle(
             name=f'TCHeading{sz}', parent=styles['Heading2'],
@@ -1997,8 +2093,8 @@ class GEMATCGenerator(tk.Tk):
                     img_h = real_h * ratio
                     rl_img = RLImage(img_path, width=img_w, height=img_h)
                     rl_img.hAlign = align_tag.upper() if align_tag in ("left", "right", "center") else 'CENTER'
-                    elems.append(Spacer(1, 6))
                     rl_img._restrictSize(usable_w, usable_h)
+                    elems.append(Spacer(1, 6))
                     elems.append(rl_img)
                     elems.append(Spacer(1, 6))
                 elems.append(PageBreak())
@@ -2086,7 +2182,6 @@ class GEMATCGenerator(tk.Tk):
         self.status_text.set("Document cleared.")
         self.text_sizes = {}
         self.fast_img_cache.clear()
-        self.fast_img_seq.clear()
         if self.temp_dir and os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
             self.temp_dir = tempfile.mkdtemp()
@@ -2094,6 +2189,7 @@ class GEMATCGenerator(tk.Tk):
             child.destroy()
         self.preview_pages_tk.clear()
         self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
+        self.page_info_var.set("Pages: 0")
         self.on_editor_change()
 
 
