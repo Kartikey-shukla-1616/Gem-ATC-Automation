@@ -409,6 +409,8 @@ class GEMATCGenerator(tk.Tk):
         self.preview_loading = False
         self.preview_update_after = None
 
+        self.heading_pagebreak_lines = set()
+
         self._build_ui()
         self.status_text.set("Ready")
         self.update_clock()
@@ -690,24 +692,37 @@ class GEMATCGenerator(tk.Tk):
         try:
             start = self.text.index("sel.first")
             end = self.text.index("sel.last")
+            start_line = int(start.split(".")[0])
+            end_line = int(end.split(".")[0])
         except tk.TclError:
             cur = self.text.index("insert")
-            lineno = cur.split('.')[0]
+            lineno = int(cur.split('.')[0])
             line_start = f"{lineno}.0"
             line_end = f"{lineno}.0 lineend"
             for img_name in self.text.image_names():
                 idx = self.text.index(img_name)
-                if idx.split('.')[0] == lineno:
+                if int(idx.split('.')[0]) == lineno:
                     messagebox.showinfo("Info", "Image wali line ko heading nahi bana sakte. Heading ko image ke upar ya kisi text line par rakho.")
                     return
             start, end = line_start, line_end
+            start_line = lineno
+            end_line = lineno
 
-        for tag in ("bold", "italic", "underline", "left", "right", "center", "bullet"):
-            self.text.tag_remove(tag, start, end)
+        for line in range(start_line, end_line + 1):
+            line_start = f"{line}.0"
+            line_end = f"{line}.0 lineend"
 
-        self.text.tag_add("heading", start, end)
-        self.text.tag_add("center", start, end)
-        self.status_text.set("Selected text/line set as centered heading.")
+            for tag in ("bold", "italic", "underline", "left", "right", "center", "bullet"):
+                self.text.tag_remove(tag, line_start, line_end)
+
+            self.text.tag_add("heading", line_start, line_end)
+            self.text.tag_add("center", line_start, line_end)
+
+            txt = self.text.get(line_start, line_end).strip()
+            if txt:
+                self.heading_pagebreak_lines.add(line)
+
+        self.status_text.set("Selected text/line set as centered heading and will start from next page in PDF.")
         self.on_editor_change()
 
     def track_cursor(self, event):
@@ -1209,6 +1224,7 @@ class GEMATCGenerator(tk.Tk):
                 self._delete_editor_line_image_only(line)
             self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
             self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
+            self.heading_pagebreak_lines -= lines_to_remove
             self.status_text.set(f"Deleted {len(lines_to_remove)} PDF/JPG pages.")
             self.on_editor_change()
 
@@ -1334,6 +1350,7 @@ class GEMATCGenerator(tk.Tk):
                 self._delete_editor_line_image_only(line)
             self.tracked_images = [r for r in self.tracked_images if r[0] not in lines_to_remove]
             self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_remove]
+            self.heading_pagebreak_lines -= lines_to_remove
             self.status_text.set(f"Deleted {len(lines_to_remove)} Add Docs pages.")
             self.on_editor_change()
 
@@ -1406,6 +1423,7 @@ class GEMATCGenerator(tk.Tk):
                 capture = False
                 headinginserted = False
                 self.text.delete("1.0", tk.END)
+                self.heading_pagebreak_lines.clear()
 
                 for page in pdf.pages:
                     pagetext = page.extract_text() or ""
@@ -1438,6 +1456,7 @@ class GEMATCGenerator(tk.Tk):
                                 hend = self.text.index("end-1c")
                                 self.text.tag_add("heading", hstart, hend)
                                 self.text.tag_add("center", hstart, hend)
+                                self.heading_pagebreak_lines.add(int(hstart.split(".")[0]))
                                 self.text.insert(tk.END, "\n")
                                 headinginserted = True
                             continue
@@ -1513,6 +1532,8 @@ class GEMATCGenerator(tk.Tk):
 
         elems = []
         preview_source_map = []
+        current_page_sources = []
+        current_page_has_content = False
 
         total_lines = int(self.text.index("end-1c").split('.')[0])
         images_by_line = {}
@@ -1522,111 +1543,71 @@ class GEMATCGenerator(tk.Tk):
         usablew = frame_width * 0.95
         usableh = frame_height * 0.82
 
-        current_page_sources = []
-        page_started = False
-
-        def ensure_page_started():
-            nonlocal page_started
-            if not page_started:
-                page_started = True
-
-        def flush_page_if_needed():
-            nonlocal current_page_sources, page_started
-            if page_started:
+        def flush_page_sources():
+            nonlocal current_page_sources, current_page_has_content
+            if current_page_has_content or current_page_sources:
                 preview_source_map.append({"sources": list(current_page_sources)})
-                current_page_sources = []
-                page_started = False
+            current_page_sources = []
+            current_page_has_content = False
 
-        def make_para_for_line(line_no, line_text, tags):
-            size = 12
-            for tag in tags:
-                if tag.startswith("size"):
-                    try:
-                        size = int(tag.replace("size", ""))
-                    except Exception:
-                        pass
-
-            if "heading" in tags:
-                style = heading_style(size)
-            else:
-                style = normal_style(size)
-
-            if "heading" in tags or "center" in tags:
-                style.alignment = TA_CENTER
-            elif "right" in tags:
-                style.alignment = TA_RIGHT
-            else:
-                style.alignment = TA_LEFT
-
-            if "bold" in tags or "heading" in tags:
-                style.fontName = self.bold_font_name
-
-            return Paragraph(line_text, style)
-
-        i = 1
-        while i <= total_lines:
+        for i in range(1, total_lines + 1):
             linetext = self.text.get(f"{i}.0", f"{i}.0 lineend").strip()
             tags = self.text.tag_names(f"{i}.0")
 
-            if "heading" in tags:
-                heading_para = make_para_for_line(i, linetext, tags)
-                block_parts = [heading_para]
-                block_sources = [{"type": "text", "line": i}]
-
-                j = i + 1
-                found_image_under_heading = False
-
-                while j <= total_lines:
-                    next_text = self.text.get(f"{j}.0", f"{j}.0 lineend").strip()
-                    next_tags = self.text.tag_names(f"{j}.0")
-
-                    if next_text:
-                        break
-
-                    if j in images_by_line:
-                        found_image_under_heading = True
-                        for pilimg, aligntag in images_by_line[j]:
-                            imgpath, realw, realh = self._cache_image_once(pilimg)
-                            ratio = min(usablew / realw, usableh / realh, 1.0)
-                            imgw = realw * ratio
-                            imgh = realh * ratio
-
-                            rlimg = RLImage(imgpath, width=imgw, height=imgh)
-                            rlimg.hAlign = aligntag.upper() if aligntag in ("left", "right", "center") else "CENTER"
-                            rlimg._restrictSize(usablew, usableh)
-
-                            block_parts.append(Spacer(1, 6))
-                            block_parts.append(rlimg)
-                            block_parts.append(Spacer(1, 8))
-                            block_sources.append({"type": "image", "line": j})
-                        j += 1
-                        continue
-
-                    if "heading" in next_tags:
-                        break
-
-                    j += 1
-
-                ensure_page_started()
-                if found_image_under_heading:
-                    elems.append(KeepTogether(block_parts))
-                else:
-                    elems.append(heading_para)
-
-                current_page_sources.extend(block_sources)
-                i = j if found_image_under_heading else i + 1
-                continue
+            if i in self.heading_pagebreak_lines and (elems or current_page_has_content or current_page_sources):
+                while elems and isinstance(elems[-1], Spacer):
+                    elems.pop()
+                elems.append(PageBreak())
+                flush_page_sources()
 
             if linetext:
-                ensure_page_started()
-                para = make_para_for_line(i, linetext, tags)
-                elems.append(para)
-                current_page_sources.append({"type": "text", "line": i})
-                i += 1
-                continue
+                size = 12
+                for tag in tags:
+                    if tag.startswith("size"):
+                        try:
+                            size = int(tag.replace("size", ""))
+                        except Exception:
+                            pass
 
-            if i in images_by_line:
-                ensure_page_started()
+                if "heading" in tags:
+                    style = heading_style(size)
+                else:
+                    style = normal_style(size)
+
+                if "heading" in tags or "center" in tags:
+                    style.alignment = TA_CENTER
+                elif "right" in tags:
+                    style.alignment = TA_RIGHT
+                else:
+                    style.alignment = TA_LEFT
+
+                if "bold" in tags or "heading" in tags:
+                    style.fontName = self.bold_font_name
+
+                para = Paragraph(linetext, style)
+
+                if i in images_by_line:
+                    for pilimg, aligntag in images_by_line[i]:
+                        imgpath, realw, realh = self._cache_image_once(pilimg)
+                        ratio = min(usablew / realw, usableh / realh, 1.0)
+                        imgw = realw * ratio
+                        imgh = realh * ratio
+
+                        rlimg = RLImage(imgpath, width=imgw, height=imgh)
+                        rlimg.hAlign = aligntag.upper() if aligntag in ("left", "right", "center") else "CENTER"
+                        rlimg._restrictSize(usablew, usableh)
+
+                        block = KeepTogether([para, Spacer(1, 6), rlimg, Spacer(1, 8)])
+                        elems.append(block)
+                        current_page_sources.append({"type": "text", "line": i})
+                        current_page_sources.append({"type": "image", "line": i})
+                        current_page_has_content = True
+                else:
+                    elems.append(para)
+                    current_page_sources.append({"type": "text", "line": i})
+                    current_page_has_content = True
+
+            elif i in images_by_line:
                 for pilimg, aligntag in images_by_line[i]:
                     imgpath, realw, realh = self._cache_image_once(pilimg)
                     ratio = min(usablew / realw, usableh / realh, 1.0)
@@ -1636,15 +1617,13 @@ class GEMATCGenerator(tk.Tk):
                     rlimg = RLImage(imgpath, width=imgw, height=imgh)
                     rlimg.hAlign = aligntag.upper() if aligntag in ("left", "right", "center") else "CENTER"
                     rlimg._restrictSize(usablew, usableh)
-
                     elems.append(Spacer(1, 6))
                     elems.append(rlimg)
                     elems.append(Spacer(1, 8))
                     current_page_sources.append({"type": "image", "line": i})
+                    current_page_has_content = True
 
-            i += 1
-
-        flush_page_if_needed()
+        flush_page_sources()
 
         while elems and isinstance(elems[-1], PageBreak):
             elems.pop()
@@ -1716,6 +1695,7 @@ class GEMATCGenerator(tk.Tk):
         self.preview_layout = []
         self.preview_page_objects = {}
         self.preview_generation_id += 1
+        self.heading_pagebreak_lines.clear()
 
         if self.temp_dir and os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -2114,6 +2094,7 @@ class GEMATCGenerator(tk.Tk):
         self.pdf_images = [r for r in self.pdf_images if r[2] not in lines_to_delete]
         self.docs_images = [r for r in self.docs_images if r[2] not in lines_to_delete]
         self.image_archive = [e for e in self.image_archive if e["line"] not in lines_to_delete]
+        self.heading_pagebreak_lines -= set(lines_to_delete)
 
     def remove_pages_from_preview_input(self):
         if self.preview_total_pages == 0 or not self.preview_source_map:
